@@ -9,6 +9,8 @@
 # ...
 #_______________________________________________
 
+device_ids        : [0]
+
 case_index        : 0      # used for backup name
 Stage             : 1       # 0: Only sparse reconstruction 1: Only temporal propagation -1: Train both together
 Repeat_id         : 0       # Different propagator id sharing the same encoder and decoder

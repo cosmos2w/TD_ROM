@@ -24,15 +24,12 @@ from models import (
     PerceiverReconstructor, SoftDomainAdaptiveReconstructor
 )
 
-device_ids = [2]
-device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
-
 # ---------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="collinear_flow_Re40",
+        default="cylinder_flow",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -69,7 +66,7 @@ def load_cfg(yaml_path: pathlib.Path) -> dict:
     return cfg
 
 # ---------------------------------------------------------
-def build_model(cfg: dict,  N_c: int, device: torch.device) -> TD_ROM:
+def build_model(cfg: dict,  N_c: int) -> TD_ROM:
 
     mlp_A2U     = [cfg["F_dim"], 256, 256, 256, cfg["U_dim"]]
     NN_A2U      = MLP(mlp_A2U)
@@ -332,6 +329,9 @@ def compute_elbo(base_model, uncert, coords, stage, cfg):
 # ---------------------------------------------------------------
 def train(cfg: dict):
 
+    device_ids = cfg["device_ids"]
+    device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
+
     train_ld, test_ld, N_c, Num_all_recon_pts = make_loaders(
         cfg["data_h5"],
         num_time_sample    = cfg["num_time_sample"],
@@ -355,7 +355,7 @@ def train(cfg: dict):
     retain_cls             = cfg.get("retain_cls", False) if Use_Adaptive_Selection else False
     Supervise_Sensors      = cfg.get("Supervise_Sensors", False)  if Use_Adaptive_Selection else False
 
-    model, Net_Name = build_model(cfg, N_c, device)
+    model, Net_Name = build_model(cfg, N_c)
 
     stage = cfg["Stage"]  
     Reload_Trained = cfg.get("Reload_Trained", False)

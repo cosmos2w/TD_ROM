@@ -3,6 +3,8 @@
 # ...
 #_______________________________________________
 
+device_ids        : [0]
+
 case_index        : 0      
 Stage             : 0
 # 0: Only sparse reconstruction 

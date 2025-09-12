@@ -7,9 +7,6 @@ from src.dataloading import make_loaders
 from src.models      import TDROMEncoder_Sen, Decoder_Sen, TemporalDecoderSoftmax, TD_ROM
 from src.utils.plot_utils import plot_loss_history
 
-device_ids = [2]
-device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -85,6 +82,9 @@ def build_model(cfg: dict,  N_c: int, device: torch.device) -> TD_ROM:
 
 # ---------------------------------------------------------------
 def train(cfg: dict):
+
+    device_ids = cfg["device_ids"]
+    device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
 
     # 1) data --------------------------------------------------
     train_ld, test_ld, N_c, Num_all_recon_pts = make_loaders(
