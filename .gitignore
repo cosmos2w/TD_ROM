@@ -20,3 +20,4 @@ Reaction_Diffusion/
 *.h5
 *.tar
 *.pt
+*.yaml
