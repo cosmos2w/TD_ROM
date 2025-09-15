@@ -14,7 +14,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="collinear_flow_Re40",
+        default="cylinder_flow",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )

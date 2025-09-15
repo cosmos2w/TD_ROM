@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="cylinder_flow",
+        default="collinear_flow_Re100",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -294,16 +294,17 @@ def compute_elbo(base_model, uncert, coords, stage, cfg):
         mean_phi_2 = torch.clamp(mean_phi_2, min=1e-3, max=1-1e-3)  # Clamp for stability
     else:
         mean_phi_2 = torch.ones_like(mean_phi_1) # No temporal uncertainty considered
-    
+
     phi_mean_all = mean_phi_1 * mean_phi_2
 
-    mc_samples_elbo = cfg["bayesian_phi"].get("mc_samples_elbo", 5)  # Default to 5 for better estimate
+    mc_samples_elbo = cfg["bayesian_phi"].get("mc_samples_elbo", 5)
     log_lik = 0.0
     for _ in range(mc_samples_elbo):
         phi_1_s = phi_dist_1.rsample()  # [N_pts]
         phi_2_s = phi_dist_2.rsample() if 'phi_dist_2' in locals() else torch.ones_like(phi_1_s)
         phi_s = phi_1_s * phi_2_s
-        log_lik += (uncert * phi_s).mean()  # Scalar
+        # log_lik += (uncert * phi_s).mean()
+        log_lik += - (uncert * (1 - phi_s)).mean()  # to penalize low phi in high-uncert areas
 
     log_lik /= mc_samples_elbo
 
@@ -320,7 +321,7 @@ def compute_elbo(base_model, uncert, coords, stage, cfg):
     else:
         kl              = 0.0
         entropy         = 0.0
-    
+
     var_phi = torch.var(phi_mean_all)
     var_weight = cfg["bayesian_phi"].get("var_weight", 1.0)  # Weight to encourage phi variance
     elbo = log_lik - kl + cfg["bayesian_phi"].get("vi_entropy_weight", 0.1) * entropy + var_weight * var_phi
@@ -518,7 +519,7 @@ def train(cfg: dict):
                 stage == 0 or cfg["bayesian_phi"].get("update_in_stage1", True))
             
             if update_phi:  # ELBO components: to reward high phi on high residuals
-                coords_fro_phi = Y[0]  # [N_pts, 2]
+                coords_for_phi = Y[0]  # [N_pts, 2]
                 # ----------------------------------------
                 var_pred = torch.exp(out_logvar).detach() if out_logvar is not None else torch.zeros_like(out)
                 # pool over batch/time/channel
@@ -553,7 +554,7 @@ def train(cfg: dict):
                     uncert = (1 - spectral_blend_weight) * uncert + spectral_blend_weight * spectral_uncert
 
                 # ----------------------------------------
-                elbo = compute_elbo(base_model, uncert, coords_fro_phi, stage, cfg)
+                elbo = compute_elbo(base_model, uncert, coords_for_phi, stage, cfg)
                 lambda_elbo     = cfg["bayesian_phi"]["lambda_elbo"] * min(epoch / cfg["bayesian_phi"]["anneal_epochs"], 1.0)
                 elbo_loss       = elbo * lambda_elbo
             else:

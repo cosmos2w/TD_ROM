@@ -14,8 +14,6 @@ It follows these procedures:
   * Run the model to create a reconstructed spatiotemporal distribution.
   * Compute the MSE loss and plot/save the ground truth, prediction, and error fields.
 
-Usage:
-    python -m src.evaluate --case_idx 50 --T_ini 100 --N_pred 128 --num_space_sample 64 --cmap viridis --seed 0
 """
 
 import os
@@ -39,15 +37,13 @@ from matplotlib import animation
 from typing import Sequence
 from src.utils.plot_utils import save_plot
 from src.utils.SpecialLosses import get_loss, select_high_freq_sensors
-from src.models import(
-    MLP, TD_ROM, TD_ROM_Bay, TD_ROM_Bay_DD,
-    TransformerSpatialEncoder, FourierTransformerSpatialEncoder, DomainAdaptiveEncoder,
-    TemporalDecoderLinear, DelayEmbedNeuralODE, TemporalDecoder_Standard, TemporalDecoderSoftmax,UncertaintyAwareTemporalDecoder,
-    DeepONetDecoder, PerceiverReconstructor, SoftDomainAdaptiveReconstructor, DomainAdaptiveReconstructor, MLP, kl_gaussian
+from src.models import (
+    MLP, TD_ROM, TD_ROM_Bay_DD,
+    FourierTransformerSpatialEncoder, DomainAdaptiveEncoder, 
+    TemporalDecoderLinear, DelayEmbedNeuralODE, TemporalDecoderSoftmax, UncertaintyAwareTemporalDecoder,
+    PerceiverReconstructor, SoftDomainAdaptiveReconstructor
 )
 
-# device_ids = [2]
-# device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
 device = torch.device("cpu")
 
 def load_yaml_config(base_dir, net_index, stage_index, Repeat_id):
@@ -92,6 +88,8 @@ def regenerate_equal_grid(Nx, Ny, delta_xy=0.01):
     xy_u = coords_u.reshape(-1, 2)
     return coords_u, xy_u, x_u, y_u
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2] 
+DATA_ROOT = REPO_ROOT 
 def load_h5_data(h5_path):
     """
     Load the processed HDF5 dataset using the repository-standard format.
@@ -101,6 +99,13 @@ def load_h5_data(h5_path):
         time_vector : Tensor of shape (N_t,)
 
     """
+
+    h5_path = pathlib.Path(h5_path)
+    if not h5_path.is_absolute():
+        h5_path = (REPO_ROOT / h5_path).resolve()  # or use DATA_ROOT if fp is relative to repo root
+    if not h5_path.exists():
+        raise FileNotFoundError(f"Data file not found: {h5_path}")
+
     with h5py.File(h5_path, "r") as f:
         fields_np  = f["fields"][...].astype("float32")        # (1,N_t,N_x,N_y,N_z,2)
         coords  = f["coordinates"][...].astype("float32")   # (N_x,N_y,N_z,N_z,3)
@@ -135,47 +140,37 @@ def load_h5_data(h5_path):
     return fields, xy, t_vec, torch.from_numpy(U)
 
 # ---------------------------------------------------------
-def build_model(cfg: dict,  N_c: int, device: torch.device) -> TD_ROM:
+def build_model(cfg: dict,  N_c: int) -> TD_ROM:
 
-    branch_dims = [cfg["F_dim"], 512, 512, 512, cfg["p_decode"]]
-    trunk_dims  = [cfg["Spatial_Dim"], 1024, 1024, 1024, cfg["p_decode"]]
     mlp_A2U     = [cfg["F_dim"], 256, 256, 256, cfg["U_dim"]]
-    # sel_former  = SensorScoringTransformer(input_dim=4, embed_dim=128, num_layers=3, num_heads=4, dropout=0.0, max_positions=2048)
+    NN_A2U      = MLP(mlp_A2U)
 
-    if cfg['Stage'] == 0:
-        Net_Name = f"TD_ROM_id{cfg['case_index']}_st{cfg['Stage']}"
-    else:
-        Net_Name = f"TD_ROM_id{cfg['case_index']}_st{cfg['Stage']}_num{cfg['Repeat_id']}"
+    Net_Name = f"TD_ROM_id{cfg['case_index']}_st{cfg['Stage']}_num{cfg['Repeat_id']}"
 
     Use_Adaptive_Selection = cfg.get("Use_Adaptive_Selection", False)
     domain_decompose       = cfg.get('domain_decompose', False)
-    CalRecVar              = cfg.get("CalRecVar", False)               # Controls if calculate the global reconstruction uncertainty
+    CalRecVar              = cfg.get("CalRecVar", False)
     retain_cls             = cfg.get("retain_cls", False)     
 
     if domain_decompose and cfg['pooling'] == 'none':
         encoder = DomainAdaptiveEncoder(
-            All_dim=cfg["F_dim"],
-            num_heads=cfg["num_heads"],
-            latent_layers=cfg["num_layers"],
-            N_channels=N_c,
-            Net_Name=Net_Name,
-            CheckPhi=cfg["CheckPhi"],
-            num_freqs=cfg["num_freqs"],
-            use_temporal=cfg["use_temporal"],
-            latent_tokens=cfg["latent_tokens"],  # Ignored, use dynamic
-            pooling=cfg["pooling"],
-            max_tokens=cfg.get('max_tokens', 32),
-            retain_cls = retain_cls,
+            All_dim         = cfg["F_dim"],
+            num_heads       = cfg["num_heads"],
+            latent_layers   = cfg["num_layers"],
+            N_channels      = N_c,
+            num_freqs       = cfg["num_freqs"],
+            use_temporal    = cfg["use_temporal"],
+            latent_tokens   = cfg["latent_tokens"],
+            pooling         = cfg["pooling"],
+            retain_cls      = retain_cls,
         )
-        print(f'\nBuilding Perceiver with DOMAIN DECOMPOSITION as the sensor encoder!\n')
+        print(f'\nBuilding Domain Adaptive Encoder as the sensor encoder!\n')
     else:
         encoder = FourierTransformerSpatialEncoder(
             All_dim         = cfg["F_dim"],
             num_heads       = cfg["num_heads"],
             latent_layers   = cfg["num_layers"],
             N_channels      = N_c,
-            Net_Name        = Net_Name,
-            CheckPhi        = cfg["CheckPhi"],
             num_freqs       = cfg["num_freqs"],
             use_temporal    = cfg["use_temporal"],
             latent_tokens   = cfg["latent_tokens"],
@@ -183,7 +178,7 @@ def build_model(cfg: dict,  N_c: int, device: torch.device) -> TD_ROM:
         )
         print(f'\nBuilding FourierTransformerSpatialEncoder as the sensor encoder!\n')
 
-    assert cfg["decoder_type"] in ("LinTrans", "DelayNODE", "CausalTrans", "StdTrans", "UD_Trans")
+    assert cfg["decoder_type"] in ("LinTrans", "DelayNODE", "CausalTrans", "UD_Trans")
     if cfg["decoder_type"] == "LinTrans":
         decoder_lat = TemporalDecoderLinear(
             d_model = cfg["F_dim"],
@@ -205,73 +200,50 @@ def build_model(cfg: dict,  N_c: int, device: torch.device) -> TD_ROM:
             n_heads = cfg["num_heads"],
             dt      = cfg["delta_t"],
         )
-    elif cfg["decoder_type"] == "StdTrans":
-        decoder_lat = TemporalDecoder_Standard(
-            d_model = cfg["F_dim"],
-            n_layers= cfg["num_layers_propagator"],
-            n_heads = cfg["num_heads"],
-            dt      = cfg["delta_t"],
-        )
     elif cfg["decoder_type"] == "UD_Trans": # UD = uncertainty-driven
         decoder_lat = UncertaintyAwareTemporalDecoder(
             d_model = cfg["F_dim"],
             n_layers= cfg["num_layers_propagator"],
             n_heads = cfg["num_heads"],
             dt      = cfg["delta_t"],
-            unc_token_dim=cfg.get("unc_token_dim", 16),  # Default from cfg or 16
-            gamma=cfg.get("gamma", 1.0)  # Default 1.0
+            unc_token_dim=cfg.get("unc_token_dim", 16),
+            gamma=cfg.get("gamma", 1.0)
         )
 
-    assert cfg["reconstructor_type"] in ("Perceiver", "DeepONet")
-    if cfg["reconstructor_type"] == "DeepONet":
-        field_dec = DeepONetDecoder(branch_dims, trunk_dims, N_channels= N_c, p=cfg["p_decode"])
-        print(f'\nBuilding DeepONet as the field reconstructor!\n')
-    elif cfg["reconstructor_type"] == "Perceiver":
-        if domain_decompose and cfg['pooling'] == 'none':
-
-            field_dec = SoftDomainAdaptiveReconstructor(
-                d_model=cfg["F_dim"],
-                num_heads=cfg["num_heads"],
-                N_channels=N_c,
-                pe_module=encoder.pos_embed,
-                fusion_mode="shared_attn", importance_scale=cfg.get('importance_scale', 1.0),  # From parent
-                bandwidth_init=cfg["bandwidth_init"], top_k=cfg["top_k"], per_sensor_sigma=cfg["per_sensor_sigma"],  # Soft-specific
-                CalRecVar = CalRecVar,
-                retain_cls = retain_cls,
+    if domain_decompose and cfg['pooling'] == 'none':
+        field_dec = SoftDomainAdaptiveReconstructor(
+            d_model=cfg["F_dim"],
+            num_heads=cfg["num_heads"],
+            N_channels=N_c,
+            pe_module=encoder.pos_embed,
+            
+            importance_scale=cfg["importance_scale"],
+            bandwidth_init=cfg["bandwidth_init"], top_k=cfg["top_k"], per_sensor_sigma=cfg["per_sensor_sigma"], 
+            CalRecVar = CalRecVar,
+            retain_cls = retain_cls,
+        )
+        print(f'\nBuilding SoftDomainAdaptiveReconstructor as the field reconstructor!\n')
+    else:
+        field_dec = PerceiverReconstructor(
+                d_model  = cfg["F_dim"],          
+                num_heads  = cfg["num_heads"],
+                N_channels = N_c,
+                pe_module  = encoder.pos_embed,   # weight sharing
             )
-            print(f'\nBuilding SoftDomainAdaptiveReconstructor as the field reconstructor!\n')
-
-        else:
-            field_dec = PerceiverReconstructor(
-                    d_model  = cfg["F_dim"],          
-                    num_heads  = cfg["num_heads"],
-                    N_channels = N_c,
-                    pe_module  = encoder.pos_embed,   # weight sharing
-                )
-            print(f'\nBuilding Perceiver as the field reconstructor!\n')
-
-    NN_A2U    = MLP(mlp_A2U)
+        print(f'\nBuilding Perceiver-style decoder as the field reconstructor!\n')
 
     if cfg["Use_Adaptive_Selection"] == True:
-        if domain_decompose and cfg['pooling'] == 'none':
-            net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec, NN_A2U,
-                        delta_t = cfg["delta_t"], N_window = cfg["N_window"], Net_Name = Net_Name,
-                        CheckPhi = cfg["CheckPhi"], stage=cfg["Stage"],
-                        use_adaptive_selection=Use_Adaptive_Selection, CalRecVar = CalRecVar, retain_cls = retain_cls)
-        else:
-            net = TD_ROM_Bay(cfg, encoder, decoder_lat, field_dec, NN_A2U,
-                        delta_t = cfg["delta_t"], N_window = cfg["N_window"], Net_Name = Net_Name,
-                        CheckPhi = cfg["CheckPhi"], stage=cfg["Stage"],
-                        use_adaptive_selection=Use_Adaptive_Selection)
+        net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec,
+                    delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"],
+                    use_adaptive_selection=Use_Adaptive_Selection, CalRecVar = CalRecVar, retain_cls = retain_cls)
     else:
-        net = TD_ROM(encoder, decoder_lat, field_dec, NN_A2U,
-                    delta_t = cfg["delta_t"], N_window = cfg["N_window"], Net_Name = Net_Name,
-                    CheckPhi = cfg["CheckPhi"], stage=cfg["Stage"])  
+        net = TD_ROM(encoder, decoder_lat, field_dec, 
+                    delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"])  
 
     return net, Net_Name
 
-
 # --------------------------------------------------------------- 1. Load Data
+
 def load_data(cfg, args):
     torch.manual_seed(args.seed)
     fields, coords, time_vec, conditions = load_h5_data(cfg["data_h5"])
@@ -403,7 +375,7 @@ def build_tensors(u_true_full, xy_norm, region_idx, recon_idx, time_vec,
 
 # ------------------------------------------------- 7. Load Network
 def load_network(cfg, N_c, device):
-    model, Net_Name = build_model(cfg, N_c, device)
+    model, Net_Name = build_model(cfg, N_c)
     print(f'The Net_Name is {Net_Name}')
     ckpt_path = os.path.join(cfg["save_net_dir"], f"Net_{Net_Name}.pth")
     state_dict = torch.load(ckpt_path, map_location=device)
@@ -714,7 +686,15 @@ def reconstruct(cfg, args):
     
 def main():
     parser = argparse.ArgumentParser(description="TD-ROM Evaluation")
-    parser.add_argument('--indice', type=int, default=100, 
+
+    parser.add_argument(
+        "--dataset",
+        default="cylinder_flow",
+        type=str,
+        help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
+    )
+
+    parser.add_argument('--indice', type=int, default=1, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=0, 
                         help='net checkpoint index: which stage')
@@ -723,11 +703,11 @@ def main():
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
 
-    parser.add_argument("--T_ini", type=int, default=200,
+    parser.add_argument("--T_ini", type=int, default=4500,
                         help="Initial time index from which to start prediction")
     parser.add_argument("--N_pred", type=int, default=1,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=64,
+    parser.add_argument("--num_space_sample", type=int, default=8,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,
@@ -748,7 +728,8 @@ def main():
 
     script_dir = pathlib.Path(__file__).resolve().parent
     project_root = script_dir.parent
-    config_base_dir = project_root / "Save_config_files" / "config_bk_TDOM"
+    dataset = args.dataset
+    config_base_dir = project_root / "Save_config_files" / dataset / "config_bk_TDOM"
 
     cfg = load_yaml_config(config_base_dir, args.indice, args.stage, args.Repeat_id)
 

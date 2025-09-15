@@ -1761,8 +1761,8 @@ class SoftDomainAdaptiveReconstructor(PerceiverReconstructor):
         d_model        = self.lat_proj.out_features
 
         S = sensor_coords.size(1)  # true number of sensors (excludes CLS)
-        if phi_mean is None:
-            phi_mean = torch.ones(B, S, device=dev)  # [B,S]
+
+        if phi_mean is None: phi_mean = torch.ones(B, S, device=dev)  # [B,S]
 
         if self.per_sensor_sigma:
             if (self.log_sigma is None) or (self.log_sigma.numel() != S):
@@ -2074,22 +2074,26 @@ class TD_ROM_Bay_DD(nn.Module):
 
             log_ab_1 = self.phi_mlp_1(current_coords)                         
             alpha_1  = torch.exp(log_ab_1[:, :, 0]) + 1e-3                     
-            beta_1   = torch.exp(log_ab_1[:, :, 1]) + 1e-3                     
-            # Compute mean phi (Beta expectation) instead of sampling
-            mean_phi_1 = alpha_1 / (alpha_1 + beta_1)  
-            mean_phi_1 = torch.clamp(mean_phi_1, min=1e-3, max=1-1e-3)  # Clamp for stability
+            beta_1   = torch.exp(log_ab_1[:, :, 1]) + 1e-3
+            if self.training: phi_1 = torch.distributions.Beta(alpha_1, beta_1).rsample()
+            else:
+                # Compute mean phi (Beta expectation) instead of sampling
+                mean_phi_1 = torch.clamp(alpha_1 / (alpha_1 + beta_1) , min=1e-3, max=1-1e-3)  # Clamp for stability
+                phi_1 = mean_phi_1
 
             # Temporal contributions by phi_mlp_2:
             if self.stage == 1 and self.cfg["bayesian_phi"]["update_in_stage1"] == True:
                 log_ab_2 = self.phi_mlp_2(current_coords)                        
                 alpha_2  = torch.exp(log_ab_2[:, :, 0]) + 1e-3                     
-                beta_2   = torch.exp(log_ab_2[:, :, 1]) + 1e-3                    
-                mean_phi_2 = alpha_2 / (alpha_2 + beta_2)  
-                mean_phi_2 = torch.clamp(mean_phi_2, min=1e-3, max=1-1e-3)  
+                beta_2   = torch.exp(log_ab_2[:, :, 1]) + 1e-3
+                if self.training: phi_2 = torch.distributions.Beta(alpha_2, beta_2).rsample()
+                else:
+                    mean_phi_2 = torch.clamp(alpha_2 / (alpha_2 + beta_2), min=1e-3, max=1-1e-3)
+                    phi_2 = mean_phi_2
             else:
-                mean_phi_2 = torch.ones_like(mean_phi_1) # No temporal uncertainty considered
+                phi_2 = torch.ones_like(phi_1) # No temporal uncertainty considered
 
-            original_phi = mean_phi_1 * mean_phi_2
+            original_phi = phi_1 * phi_2
 
         # --- Transformer encoder -> latent tokens of ALL observed frames ---
         G_obs, mask_from_encoder, sensor_coords_from_encoder, merged_phi = self.fieldencoder(G_down, U, original_phi) 
@@ -2443,7 +2447,7 @@ class Decoder_Sen(nn.Module):
 
     def forward(self, latents: torch.Tensor, coords_raw: torch.Tensor):
         """
-        latents   : [B, T, N_lat, D]  or [B,T,D] after TD_ROM reshape
+        latents   : [B, T, N_lat, D]  after TD_ROM reshape
         coords_raw: [B, N_pts, coord_dim]  (with batch dim)
         """
 

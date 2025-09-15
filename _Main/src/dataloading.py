@@ -193,9 +193,10 @@ class H5SpatialTemporalDatasetConcentrated(Dataset):
  
         # --------- pool of indices we are allowed to sample ---------------
         if self.global_restriction:
-            print(f'global_restriction is {self.global_restriction}\n, will restrict reconstruction region globally!\n')
+            print(f'global_restriction is {self.global_restriction}, will restrict reconstruction region globally!\n')
             self.recon_pool = self.region_idx           # restricted pool
         else:
+            print(f'global_restriction is {self.global_restriction}, will rebuild the COMPLETE domain!\n')
             self.recon_pool = torch.arange(self.N_pts)  # full pool
 
         if self.Full_Field_DownS >= 1.0 - 1e-6:

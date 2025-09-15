@@ -109,7 +109,7 @@ bayesian_phi:
 
   viz_every: 1000                    # Visualize φ every N epochs
   viz_grid_shape: [300, 88]          # 2D grid shape for φ
-  viz_save_dir: Save_report_files/phi_viz           # Directory for φ PNG saves
+  viz_save_dir: Save_report_files/collinear_flow_Re40           # Directory for φ PNG saves
 
 # folders -------------------------------------------------
 save_loss_dir     : Save_loss_files/collinear_flow_Re40/train_test_loss_TD-ROM
