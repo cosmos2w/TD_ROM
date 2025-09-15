@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="collinear_flow_Re100",
+        default="turbulent_combustion",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -85,7 +85,6 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             latent_layers   = cfg["num_layers"],
             N_channels      = N_c,
             num_freqs       = cfg["num_freqs"],
-            use_temporal    = cfg["use_temporal"],
             latent_tokens   = cfg["latent_tokens"],
             pooling         = cfg["pooling"],
             retain_cls      = retain_cls,
@@ -141,7 +140,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             d_model=cfg["F_dim"],
             num_heads=cfg["num_heads"],
             N_channels=N_c,
-            pe_module=encoder.pos_embed,
+            pe_module=encoder.embed['pos_embed'],
             
             importance_scale=cfg["importance_scale"],
             bandwidth_init=cfg["bandwidth_init"], top_k=cfg["top_k"], per_sensor_sigma=cfg["per_sensor_sigma"], 

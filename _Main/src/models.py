@@ -121,6 +121,19 @@ class CrossAttention(nn.Module):
         y, _ = self.attn(q, k, v, need_weights=False)
         return y
 
+class SelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim,
+                                          num_heads,
+                                          dropout=dropout,
+                                          batch_first=True)
+
+    def forward(self, x, pad_mask=None, attn_mask=None):
+        x = self.norm(x)
+        return self.attn(x, x, pad_mask=pad_mask, attn_mask=attn_mask)
+
 def latent_block(dim, num_heads, dropout):
     return nn.TransformerEncoderLayer(dim,
                                       num_heads,
@@ -279,7 +292,7 @@ class FourierTransformerSpatialEncoder(nn.Module):
 
         return lat_vec
 
-class DomainAdaptiveEncoder(FourierTransformerSpatialEncoder):
+class _DomainAdaptiveEncoder(FourierTransformerSpatialEncoder):
 
     def __init__(self, 
                  *args, 
@@ -302,6 +315,14 @@ class DomainAdaptiveEncoder(FourierTransformerSpatialEncoder):
             latent_block(self.All_dim, self.num_heads, dropout = 0.0),
             num_layers=2
         )
+
+        self.token_to_latent        = CrossAttention(self.All_dim, self.num_heads, dropout = 0.0)
+        self.token_to_latent_norm   = nn.RMSNorm(self.All_dim)
+
+        # self.token_to_latent_mixer = nn.TransformerEncoder(
+        #     latent_block(self.All_dim, self.num_heads, dropout = 0.0),
+        #     num_layers=2
+        # )
 
         # Add flag for retaining CLS in output
         self.retain_cls = retain_cls
@@ -344,13 +365,15 @@ class DomainAdaptiveEncoder(FourierTransformerSpatialEncoder):
         merged_phi = original_phi if original_phi is not None else torch.ones(B, N_input, device=tok.device)  # Fallback to uniform if no phi
 
         #--- Enhance per-sensor tokens ----------------------------------
-        lat_flat = tok_flat
 
         # Broadcast updated CLS & perform latent mixing
         # lat_flat = lat_flat + cls_upd.expand_as(lat_flat)  # Broadcast global CLS to each sensor
-        lat_flat = lat_flat + self.latent_mixer(lat_flat)
+        # lat_flat = tok_flat + self.latent_mixer(tok_flat)
 
-        # lat_flat = self.latent_mixer(lat_flat)
+        token_to_latent = self.token_to_latent_norm(tok_flat_all)
+        token_to_latent = self.token_to_latent(token_to_latent, lat, lat)
+        # token_to_latent = token_to_latent + self.token_to_latent_mixer(token_to_latent)
+        lat_flat = tok_flat + token_to_latent
 
         # If retain_cls, concatenate CLS as the first token
         if self.retain_cls:
@@ -362,6 +385,152 @@ class DomainAdaptiveEncoder(FourierTransformerSpatialEncoder):
 
         lat_vec = lat_flat.view(B, T, -1, self.All_dim)  # [B, T, N_input or (1+N_input), D]
         return lat_vec, mask, sensor_coords_padded, merged_phi
+
+# Revised 09.14
+# --------------------------------------------------
+#  Small re-usable building blocks
+# --------------------------------------------------
+def build_pos_value_proj(N_channels: int,
+                         num_freqs: int,
+                         All_dim: int) -> nn.ModuleDict:
+    return nn.ModuleDict({
+        "pos_embed": FourierEmbedding(2, num_freqs, learnable=True),
+        "pos_linear": nn.Linear(2 * num_freqs, All_dim),
+        "pos_norm": nn.RMSNorm(All_dim),
+        "val_linear": nn.Linear(N_channels, All_dim),
+        "val_norm": nn.RMSNorm(All_dim),
+    })
+
+def build_latent_bank(All_dim: int,
+                      latent_tokens: int,
+                      with_cls: bool = True) -> nn.ParameterDict:
+    p = {}
+    p["latent_param"] = nn.Parameter(torch.randn(1, latent_tokens, All_dim) * 0.02)
+    if with_cls:
+        p["cls_token"]  = nn.Parameter(torch.zeros(1, 1, All_dim))
+    return nn.ParameterDict(p)
+
+def build_transformer_stack(All_dim: int,
+                            num_heads: int,
+                            num_layers: int,
+                            dropout: float = 0.) -> nn.TransformerEncoder:
+    return nn.TransformerEncoder(
+        latent_block(All_dim, num_heads, dropout),
+        num_layers=num_layers
+    )
+
+# --------------------------------------------------
+#  Stand-alone Domain Adaptive Encoder Module
+# --------------------------------------------------
+class DomainAdaptiveEncoder(nn.Module):
+
+    def __init__(self,
+                 All_dim       : int,
+                 num_heads     : int,
+                 latent_layers : int,
+                 N_channels    : int,
+                 num_freqs     : int = 64,
+                 latent_tokens : int = 8,
+                 pooling       : str = "none",      # currently ignored
+                 *,
+                 retain_cls    : bool = False
+                 ):
+        super().__init__()
+        assert pooling in ("mean", "cls", "none")
+
+        # 1. Positional + value projection sub-modules ---------------------------
+        self.embed = build_pos_value_proj(N_channels, num_freqs, All_dim)
+
+        # 2. Latent / CLS parameters --------------------------------------------
+        self.latents = build_latent_bank(All_dim, latent_tokens, with_cls=True)
+
+        # 3. Attention blocks ----------------------------------------------------
+        self.cross_attn            = CrossAttention(All_dim, num_heads, dropout=0.0)
+        self.cross_norm            = nn.RMSNorm(All_dim)
+        self.cross_latent_mixer    = build_transformer_stack(All_dim, num_heads,
+                                                             latent_layers)
+
+        self.token_to_latent       = CrossAttention(All_dim, num_heads, dropout=0.0)
+        self.token_to_latent_norm  = nn.RMSNorm(All_dim)
+        self.token_to_latent_mixer = build_transformer_stack(All_dim, num_heads,
+                                                             latent_layers)
+
+        # -----------------------------------------------------------------------
+        self.retain_cls = retain_cls
+        print(f'self.retain_cls is {self.retain_cls} ! ')
+
+    def forward(self,
+                coords_tuv   : torch.Tensor,                     # (B,T,N, 2+C)
+                U            : torch.Tensor,                     # (unused here)
+                original_phi : Optional[torch.Tensor] = None     # (B,S)
+                ):
+        """
+        Args
+        ----
+        coords_tuv : tensor containing (x, y, value₁ … value_C)
+        U          : (reserved for future use; kept to preserve signature)
+        original_phi : optional per-token mask/weights
+
+        Returns
+        -------
+        lat_vec   : (B, T, S, D) ->  mixed latent/token set
+        mask      : (B, T, S)    ->  valid-token mask (all 1s here)
+        coords    : (B, S, 2)    ->  xy-coordinates (dummy (0,0) for CLS)
+        merged_phi: (B, S)       ->  forwarded or unity weights
+        """
+        B, T, N_inp, _ = coords_tuv.shape
+
+        # ------------------------------------------------------------------ 
+        # Split coordinates and sensor values
+        xy   = coords_tuv[..., 0:2]                                            # (B,T,N,2)
+        C_in = self.embed['val_linear'].in_features
+        vals = coords_tuv[..., 2:2 + C_in]                                     # (B,T,N,C)
+
+        # Positional & value embeddings
+        pos_tok = self.embed['pos_linear'](self.embed['pos_embed'](xy))
+        pos_tok = self.embed['pos_norm'](pos_tok)
+
+        val_tok = self.embed['val_linear'](vals)
+        val_tok = self.embed['val_norm'](val_tok)
+
+        tok      = pos_tok + val_tok                                           # (B,T,N,D)
+        tok_flat = tok.reshape(B * T, N_inp, -1)                               # (B*T,N,D)
+
+        # ------------------------------------------------------------------ 
+        # Prepare latent + CLS tokens
+        cls = self.latents['cls_token'].expand(B * T, 1, -1)                   # (B*T,1,D)
+        lat = self.latents['latent_param'].expand(B * T, -1, -1)               # (B*T,L,D)
+        lat = torch.cat([cls, lat], dim=1)                                     # (B*T,1+L,D)
+
+        # Cross-attention: sensor tokens -> latent tokens
+        lat = self.cross_norm(lat)
+        lat = lat + self.cross_attn(lat, tok_flat, tok_flat)
+        lat = self.cross_latent_mixer(lat)
+
+        # ------------------------------------------------------------------ 
+        # Feed refined latent information back into sensor tokens
+        tok_flat_up  = self.token_to_latent_norm(tok_flat)
+        tok_flat_up  = self.token_to_latent(tok_flat_up, lat, lat)
+        tok_flat_out = tok_flat + self.token_to_latent_mixer(tok_flat_up)
+
+        # ------------------------------------------------------------------ 
+        # Optionally keep CLS as part of the output token set
+        if self.retain_cls:
+            cls_upd   = lat[:, :1, :]                                          # (B*T,1,D)
+            tok_flat_out = torch.cat([cls_upd, tok_flat_out], dim=1)           # (B*T,1+N,D)
+
+        # ------------------------------------------------------------------ 
+        # Reshape back to (B,T,⋯)
+        S        = tok_flat_out.size(1)
+        lat_vec  = tok_flat_out.view(B, T, S, -1)                              # (B,T,S,D)
+
+        mask     = torch.ones(B, T, S, dtype=torch.bool, device=lat_vec.device)
+        coords   = coords_tuv[:, 0, :, :2]                                     # (B,N,2)
+        merged_phi = (original_phi
+                      if original_phi is not None
+                      else torch.ones(B, S, device=lat_vec.device))
+
+        return lat_vec, mask, coords, merged_phi
 
 # ================================================================
 # Temporal Decoder using linear transformer
@@ -1745,10 +1914,10 @@ class SoftDomainAdaptiveReconstructor(PerceiverReconstructor):
             return torch.einsum('btsd,bps->btpd', lat_proj, w)
 
     def forward(self,
-                z: torch.Tensor,             # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
-                Y: torch.Tensor,             # [B, P, 2/3]
-                sensor_coords: torch.Tensor, # [B, S, 2/3]
-                mask: torch.Tensor,          # [B, T, S] (if retain_cls=True, this is for S+1; we slice below)
+                z: torch.Tensor,                # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
+                Y: torch.Tensor,                # [B, P, 2/3]
+                sensor_coords: torch.Tensor,    # [B, S, 2/3]
+                mask: torch.Tensor,             # [B, T, S] (if retain_cls=True, this is for S+1; we slice below)
                 phi_mean: torch.Tensor | None = None,
 
                 padding_mask: torch.Tensor | None = None
@@ -1852,8 +2021,8 @@ class SoftDomainAdaptiveReconstructor(PerceiverReconstructor):
                                     False, d_k, phi_k, valid_k, local_S)
             stats = None
 
-        h = self.agg_norm(h)                                             # (B,T,P,d)
-        lat = h.reshape(B*T, P, d_model)                                 # (B*T,P,d)
+        h = self.agg_norm(h)              # (B,T,P,d)
+        lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
 
         # shared_attn shortcut to out_proj(v_proj(lat))
         if hasattr(self.cross_attn, 'to_v'):
@@ -1871,7 +2040,10 @@ class SoftDomainAdaptiveReconstructor(PerceiverReconstructor):
         local_pre = coord_tok + local_lat
         local_x = self.norm(local_pre)
 
-        local_out_mean = None
+        local_x = local_x + self.mlp(local_x)
+        local_out_mean = self.head(local_x).view(B, T, P, C)
+
+        # local_out_mean = None
         if self.retain_cls:
             cls_proj_bt = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
             # Residual add with CLS 
@@ -1884,8 +2056,6 @@ class SoftDomainAdaptiveReconstructor(PerceiverReconstructor):
             out_mean = self.head(fused_x).view(B, T, P, C)
             x_for_var = fused_x
         else:
-            local_x = local_x + self.mlp(local_x)
-            local_out_mean = self.head(local_x).view(B, T, P, C)
             out_mean = local_out_mean
             x_for_var = local_x
 
