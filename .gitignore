@@ -21,3 +21,4 @@ Reaction_Diffusion/
 *.tar
 *.pt
 *.yaml
+_Main/src/__pycache__/train_Senseiver.cpython-310.pyc
