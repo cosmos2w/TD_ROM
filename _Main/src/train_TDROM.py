@@ -20,7 +20,7 @@ from utils.SpecialLosses import compute_psd, compute_spectrum
 from models import (
     MLP, TD_ROM, TD_ROM_Bay_DD,
     FourierTransformerSpatialEncoder, DomainAdaptiveEncoder, 
-    TemporalDecoderLinear, DelayEmbedNeuralODE, TemporalDecoderSoftmax, UncertaintyAwareTemporalDecoder,
+    TemporalDecoderLinear, DelayEmbedNeuralODE, TemporalDecoderSoftmax, UncertaintyAwareTemporalDecoder, TemporalDecoderHierarchical,
     PerceiverReconstructor, SoftDomainAdaptiveReconstructor
 )
 
@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="turbulent_combustion",
+        default="collinear_flow_Re40",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -126,14 +126,21 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             dt      = cfg["delta_t"],
         )
     elif cfg["decoder_type"] == "UD_Trans": # UD = uncertainty-driven
-        decoder_lat = UncertaintyAwareTemporalDecoder(
+        # decoder_lat = UncertaintyAwareTemporalDecoder(
+        #     d_model = cfg["F_dim"],
+        #     n_layers= cfg["num_layers_propagator"],
+        #     n_heads = cfg["num_heads"],
+        #     dt      = cfg["delta_t"],
+        #     unc_token_dim=cfg.get("unc_token_dim", 16),
+        #     gamma=cfg.get("gamma", 1.0)
+        # )
+        decoder_lat = TemporalDecoderHierarchical(
             d_model = cfg["F_dim"],
             n_layers= cfg["num_layers_propagator"],
             n_heads = cfg["num_heads"],
             dt      = cfg["delta_t"],
-            unc_token_dim=cfg.get("unc_token_dim", 16),
-            gamma=cfg.get("gamma", 1.0)
         )
+        print(f'Building up the TemporalDecoderHierarchical for dynamic forecasting ! ')
 
     if domain_decompose and cfg['pooling'] == 'none':
         field_dec = SoftDomainAdaptiveReconstructor(
