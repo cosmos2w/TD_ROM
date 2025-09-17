@@ -213,8 +213,6 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             n_layers= cfg["num_layers_propagator"],
             n_heads = cfg["num_heads"],
             dt      = cfg["delta_t"],
-            unc_token_dim=cfg.get("unc_token_dim", 16),
-            gamma=cfg.get("gamma", 1.0)
         )
 
     if domain_decompose and cfg['pooling'] == 'none':
@@ -440,10 +438,13 @@ def evaluate(u_true_phys, u_pred_phys, recon_idx):
 
 # -------------------------------------------------------------- 10. Plot Results
 def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time_vec, args, cfg, global_mse):
+
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     show_ids = args.plot_ids if args.plot_ids else (0, len(time_vec) // 2, len(time_vec) - 1)
     out_dir = pathlib.Path(cfg["save_recon_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    N_window    = cfg["N_window"]
 
     for c in range(u_true_phys.size(-1)):
         ch_dir = out_dir / f"Case_{args.Data_case_idx}_{ts}" / f"ch{c}"
@@ -463,7 +464,40 @@ def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time
             cmap_field=args.cmap,
             cmap_err="inferno",
             dpi=150,
+            N_window = N_window,
         )
+
+    if args.N_pred > 1:
+        # Add time series plots for designated points
+        designated_points = [(0.5, 0.1), (0.6, 0.2), (0.4, 0.3)]  # Example designated points; can be adjusted
+        xy_recon_np = xy_recon.cpu().numpy()  # (Nr, 2)
+
+        for c in range(u_true_phys.size(-1)):
+            ch_dir = out_dir / f"Case_{args.Data_case_idx}_{ts}" / f"ch{c}"
+            ch_dir.mkdir(parents=True, exist_ok=True)
+
+            u_true_recon_np = u_true_phys[:, recon_idx, c].cpu().numpy()  # (Nt, Nr)
+            u_pred_recon_np = u_pred_phys[..., c].cpu().numpy()  # (Nt, Nr)
+            time_np = time_vec.cpu().numpy()  # (Nt,)
+
+            for i, point in enumerate(designated_points):
+                # Find closest index
+                dist = np.linalg.norm(xy_recon_np - np.array(point), axis=1)
+                closest_idx = np.argmin(dist)
+
+                true_ts = u_true_recon_np[:, closest_idx]
+                pred_ts = u_pred_recon_np[:, closest_idx]
+
+                # Plot
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.plot(time_np, true_ts, 'b-', label='Ground Truth')
+                ax.plot(time_np, pred_ts, 'r--', label='Prediction')
+                ax.set_xlabel('Time')
+                ax.set_ylabel(f'Value at {point}')
+                ax.set_title(f'Channel {c} at point {point}')
+                ax.legend()
+                plt.savefig(ch_dir / f'time_series_point{i}_ch{c}.png', dpi=150)
+                plt.close(fig)
 
     if args.SAVE_GIF and args.N_pred > 1:
         print("Saving GIFs for reconstructed temporal data...")
@@ -639,32 +673,10 @@ def reconstruct(cfg, args):
 
     u_true_full_n = fwd(u_true_full)
     Target_Window = cfg["N_window"]
-    # Target_Window = args.N_pred
-
-    # -------------------------------------------------------------------
-    # Choose observation points
-    # -------------------------------------------------------------------
-    with torch.no_grad():
-        if args.Select_Optimal:
-            xy_cand = xy_norm[cand_idx].to(device)                  # (Ncand,2)
-            log_ab  = model.phi_mlp_1(xy_cand)                      # (Ncand,2)
-            alpha   = torch.exp(log_ab[:, 0]) + 1e-3
-            beta    = torch.exp(log_ab[:, 1]) + 1e-3
-            # phi_mu  = alpha / (alpha + beta)                        # mean retain prob
-            phi_dist = torch.distributions.Beta(alpha, beta)
-            phi      = phi_dist.rsample()
-
-            k_sel            = min(args.Retain_Num, cand_idx.size(0))
-            top_local        = torch.topk(phi, k=k_sel).indices  # indices w.r.t cand_idx
-            obs_idx_sel      = cand_idx[top_local].cpu()            # absolute indices
-            print(f"Select-Optimal: from {cand_idx.numel()} candidates kept {k_sel}.")
-        else:
-            obs_idx_sel = cand_idx                                  # keep every candidate
+    obs_idx_sel = cand_idx                                  # keep every candidate
 
     G_down, G_full, xy_recon, xy_obs, t_slice = build_tensors(u_true_full_n, xy_norm, region_idx, recon_idx, 
                                                               time_vec, T_ini, N_pred, Target_Window, args, obs_idx_in=obs_idx_sel)
-    # print(f'xy_recon.shape is {xy_recon.shape}')
-    # print(f'G_down.shape is {G_down.shape}')
 
     coords_recon = coords[recon_idx]
     coords_obs = coords[obs_idx_sel]
@@ -678,17 +690,9 @@ def reconstruct(cfg, args):
     else:
         u_pred_phys = perform_inference(model, G_down, G_full, xy_recon.unsqueeze(0), U_vec, inv, CalRecVar)
 
-    k_sensors = cfg.get("k_sensors", None)
-    # k_sensors = None   
-    field_chan = 2                           # third channel = index 2
-    if k_sensors is not None and k_sensors < G_down.size(2):
-        G_down, kept_ids, _ = select_high_freq_sensors(G_down, k_sensors, field_chan, cfg["filter_meth"])
-        xy_sensors = xy_obs[kept_ids]          # (k_sensors, 2)
-    else:
-        xy_sensors = xy_obs                    # all observation points, or can also be None
-
     global_mse, global_l2_abs, global_l2_rel = evaluate(u_true_full, u_pred_phys, recon_idx)
     print(f'global_mse: {global_mse}, global_l2_abs: {global_l2_abs}, global_l2_rel: {global_l2_rel}')
+
     # plot_results(u_true_full, u_pred_phys, recon_idx, xy_recon, xy_sensors, t_slice, args, cfg, global_mse)
     plot_results(u_true_full, u_pred_phys, recon_idx, coords_recon, coords_obs, t_slice, args, cfg, global_l2_rel) 
     
@@ -702,7 +706,7 @@ def main():
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=1, 
+    parser.add_argument('--indice', type=int, default=4, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=1, 
                         help='net checkpoint index: which stage')
@@ -711,11 +715,11 @@ def main():
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
 
-    parser.add_argument("--T_ini", type=int, default=640,
+    parser.add_argument("--T_ini", type=int, default=800,
                         help="Initial time index from which to start prediction")
-    parser.add_argument("--N_pred", type=int, default=64,
+    parser.add_argument("--N_pred", type=int, default=128,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=32,
+    parser.add_argument("--num_space_sample", type=int, default=16,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,
@@ -723,7 +727,7 @@ def main():
     parser.add_argument("--Retain_Num", type=int, default=32,
                         help="Decide the number of topK important sensors")
     
-    parser.add_argument("--SAVE_GIF", action='store_true', default=True,
+    parser.add_argument("--SAVE_GIF", action='store_true', default=False,
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")

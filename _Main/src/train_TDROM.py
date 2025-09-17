@@ -782,11 +782,11 @@ def train(cfg: dict):
                 f"Epoch {epoch}:\n"
                 f" Train Loss: {avg_train_loss:.6f} (MSE: {train_mse_summary}, "
                 f"Penalty: {avg_train_loss_obs:.6f}, U_Traj: {avg_train_loss_Traj:.6f}, "
-                f"U_infer: {avg_train_loss_U:.6f}, KL: {avg_train_loss_KL:.6f}, NLL: {avg_train_loss_nll:.6f})\n"
+                f"U_infer: {avg_train_loss_U:.6f}, KL: {avg_train_loss_KL:.6f}, NLL: {avg_train_loss_nll:.6f},"
                 f"PSD: {avg_train_loss_psd:.6f}, Spectrum: {avg_train_loss_spectrum:.6f})\n"
                 f" Test  Loss: {avg_test_loss:.6f} (MSE: {test_mse_summary}, "
                 f"Penalty: {avg_test_loss_obs:.6f}, U_Traj: {avg_test_loss_Traj:.6f}, "
-                f"U_infer: {avg_test_loss_U:.6f}, KL: {avg_test_loss_KL:.6f}, NLL: {avg_test_loss_nll:.6f})"
+                f"U_infer: {avg_test_loss_U:.6f}, KL: {avg_test_loss_KL:.6f}, NLL: {avg_test_loss_nll:.6f},"
                 f"PSD: {avg_test_loss_psd:.6f}, Spectrum: {avg_test_loss_spectrum:.6f})"
             )
 

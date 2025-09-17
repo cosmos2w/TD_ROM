@@ -12,6 +12,7 @@ from typing import Sequence
 from pathlib import Path
 import pathlib
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 def plot_loss_history(
     epoch: int,
@@ -122,6 +123,7 @@ def save_plot(
     cmap_field: str = "viridis",
     cmap_err: str = "inferno",
     dpi: int = 300,
+    N_window: int = 1,
 ) -> None:
     """
     For each index in `timesteps` create a PNG with three panels:
@@ -196,19 +198,22 @@ def save_plot(
     err_max   = err_all.max()
 
     # err_min   = 0.0
-    # err_max   = 0.75
+    # err_max   = 0.50
 
     # ------------- export directory ----------------------------------------
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------- iterate over requested frames ---------------------------
+    PLOT_SENSORS = True
     for t_idx in timesteps:
         u_t = u_true[t_idx]          # (Npts,)
         u_p = u_pred[t_idx]
         err = np.abs(u_t - u_p)
         mse = np.mean((u_t - u_p) ** 2)
         t_val = times[t_idx]
+
+        if t_idx > N_window: PLOT_SENSORS = False
 
         fig = plt.figure(figsize=(12, 4))
         gs  = gridspec.GridSpec(1, 3, width_ratios=[1, 1, 1],
@@ -226,19 +231,24 @@ def save_plot(
             triang, u_p, levels=100, cmap=cmap_field,
             vmin=field_min, vmax=field_max
         )
+
         im_err = ax_err.tricontourf(
             triang, err, levels=100, cmap=cmap_err,
             vmin=err_min, vmax=err_max
         )
 
+        # im_err = ax_err.tricontourf(
+        #     triang, err, levels=100, cmap=cmap_err,
+        #     norm=LogNorm(vmin=err_min, vmax=err_max)
+        # )
+
         # ------------------- mark sensors ------------------------------------
-        if sensor_coords is not None:
+        if sensor_coords is not None and PLOT_SENSORS is True:
             ax_true.scatter(
                 sensor_coords[:, 0], sensor_coords[:, 1],
                 s=8, c="none", edgecolors="green", linewidths=0.8,
                 marker="o", zorder=4, label="sensors"
             )
-            # nice to have:
             ax_true.legend(frameon=False, loc="upper right", fontsize=8)
         # ---------------------------------------------------------------------
 

@@ -1730,7 +1730,7 @@ class CAU_MultiheadCrossAttention(nn.Module):
         out = self.out(self._merge(y))  # [B, T_q, D]
         return restore_q(out)
 
-    def step(self, query_t: torch.Tensor, key_value_t: torch.Tensor, imp_weights_t: torch.Tensor | None = None) -> torch.Tensor:
+    def step(self, query_t: torch.Tensor, key_value_t: torch.Tensor, imp_weights_t: torch.Tensor | None = None, append: bool = True) -> torch.Tensor:
         """
         Incremental attention with caching.
 
@@ -1743,6 +1743,8 @@ class CAU_MultiheadCrossAttention(nn.Module):
           - If key_value_t provides N_s (i.e., has a sensor axis), pass [B, N_s].
             These are appended to an internal importance cache aligned with K/V tokens.
           - If kv has no sensor axis, importance is ignored (treated as ones).
+
+        append: If False, compute with temporary KV/imp (no permanent append) for efficiency in Heun midpoint.
         """
         q, restore_q = self._to_B_T_D(query_t)    # [B, T_q, D]
         kv, _ = self._to_B_T_D(key_value_t)       # [B, T_kv', D] where T_kv' could be N_s (for sensors-at-step) or 1 (for CLS-at-step)
@@ -1756,33 +1758,44 @@ class CAU_MultiheadCrossAttention(nn.Module):
         k_new = self._split(self.W_k(kv))         # [B, h, Tk, d]
         v_new = self._split(self.W_v(kv))         # [B, h, Tk, d]
 
-        # Append to caches
-        if self.K is None:
-            self.K = k_new
-            self.V = v_new
-        else:
-            self.K = torch.cat([self.K, k_new], dim=2)  # concat along source length S
-            self.V = torch.cat([self.V, v_new], dim=2)
-
-        # Importance cache: detect if kv provided a sensor axis this step
+        # Importance for this step: detect if kv provided a sensor axis
         imp_step = None
         if imp_weights_t is not None:
-            # We consider kv had a sensor axis if key_value_t.dim() in {3,4} and its "tokens just added" length equals imp width
-            # That is true when kv was [B, N_s, D] or [B, 1, N_s, D] -> after flatten Tk == N_s
+            # We consider kv had a sensor axis if imp_weights_t.dim() == 2 and shapes match
             if imp_weights_t.dim() == 2 and imp_weights_t.shape[0] == B and imp_weights_t.shape[1] == Tk:
                 imp_step = imp_weights_t.to(q.dtype)
-        self._append_imp(imp_step, Tk=Tk, B=B, device=q.device, dtype=q.dtype)
+        # If None, treat as ones (will be handled below)
 
-        # Build additive attention mask from cached importance
-        S = self.K.size(2)
+        if append:
+            # Append to caches
+            if self.K is None:
+                self.K = k_new
+                self.V = v_new
+            else:
+                self.K = torch.cat([self.K, k_new], dim=2)  # concat along source length S
+                self.V = torch.cat([self.V, v_new], dim=2)
+            self._append_imp(imp_step, Tk=Tk, B=B, device=q.device, dtype=q.dtype)
+            K_use = self.K
+            V_use = self.V
+            imp_use = self.imp_cache
+        else:
+            # Temporary (no append) for efficiency
+            K_use = torch.cat([self.K, k_new], dim=2) if self.K is not None else k_new
+            V_use = torch.cat([self.V, v_new], dim=2) if self.V is not None else v_new
+            # Mimic _append_imp for temp imp
+            imp_new = imp_step if imp_step is not None else torch.ones(B, Tk, device=q.device, dtype=q.dtype)
+            imp_use = torch.cat([self.imp_cache, imp_new], dim=1) if self.imp_cache is not None else imp_new
+
+        # Build additive attention mask from (possibly temp) cached importance
+        S = K_use.size(2)
         attn_mask = None
-        if self.imp_cache is not None:
-            # imp_cache: [B, S] aligned with K/V positions
-            log_imp = torch.log(torch.clamp(self.imp_cache, min=1e-6)).to(qh.dtype)  # [B, S]
+        if imp_use is not None:
+            # imp_use: [B, S] aligned with K/V positions
+            log_imp = torch.log(torch.clamp(imp_use, min=1e-6)).to(qh.dtype)  # [B, S]
             attn_mask = log_imp.view(B, 1, 1, S)  # [B, 1, 1, S]
 
         y = F.scaled_dot_product_attention(
-            qh, self.K, self.V,
+            qh, K_use, V_use,
             attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=False
@@ -1835,10 +1848,10 @@ class TemporalDecoderHierarchical(nn.Module):
         self.cls_head    = nn.Linear(d_model, d_model)
         self.sensor_head = nn.Linear(d_model, d_model)
 
-        # Learnable positional embedding (retained)
+        # Learnable positional embedding
         self.pos_emb = nn.Parameter(torch.randn(max_len, d_model) * 0.02)
 
-        # dt handling (retained)
+        # dt handling 
         self.register_buffer("dt_const", torch.tensor(dt))
         if learnable_dt:
             self.dt_scale = nn.Parameter(torch.zeros(()))
@@ -1910,8 +1923,6 @@ class TemporalDecoderHierarchical(nn.Module):
 
     # ------------------------------------------------------------------
     # Hierarchical Block (core layer)
-    # Aligns with framework: CLS evolution (self + cross to sensors), Sensor evolution (self + cross to CLS)
-    # Adds light self-attention after cross for better extraction
     # ------------------------------------------------------------------
     def _block(
         self,
@@ -1921,6 +1932,7 @@ class TemporalDecoderHierarchical(nn.Module):
         imp: torch.Tensor,
         *,
         incremental: bool,
+        append: bool = True,  # New: Pass to .step() for no-append mode
     ) -> tuple:
         """
         Core hierarchical layer.
@@ -1931,7 +1943,7 @@ class TemporalDecoderHierarchical(nn.Module):
         """
 
         # -----------------------------------------------------------
-        # 1.  Resolve shapes that were previously missing
+        # 1.  Resolve shapes
         # -----------------------------------------------------------
         if cls.dim() == 4:                              # parallel mode
             B, T, _, D = cls.shape
@@ -1956,16 +1968,19 @@ class TemporalDecoderHierarchical(nn.Module):
 
         # Squeeze for attention compatibility (solution for CLS without revising attention class)
         cls_squeezed = cls_normed.squeeze(2 if not incremental else 1)  # [B, T, D] or [B, D]
-
         if incremental:
             cls_attn = self.cls_self_attns[idx].step(cls_squeezed)
         else:
             cls_attn = self.cls_self_attns[idx](cls_squeezed)
-
         # Unsqueeze back
         cls_attn = cls_attn.unsqueeze(2 if not incremental else 1)  # [B, T, 1, D] or [B, 1, D]
+        # cls_attn = cls_normed
 
-        cls = cls_attn + self.cls_cross_attns[idx].step(cls_normed, sensors, imp) if incremental else cls_attn + self.cls_cross_attns[idx](cls_normed, sensors, imp)
+        if incremental:
+            cls_cross = self.cls_cross_attns[idx].step(cls_normed, sensors, imp, append=append)
+        else:
+            cls_cross = self.cls_cross_attns[idx](cls_normed, sensors, imp)
+        cls = cls_attn + cls_cross
         
         cls = self.post_norms[idx](cls_residual + cls)
         cls = cls + self.ffns[idx](cls)
@@ -1992,15 +2007,6 @@ class TemporalDecoderHierarchical(nn.Module):
         else:
             sensors = sensors + self.sensor_cross_attns[idx](sensors, cls, imp)
 
-        if incremental:
-            sensors_sa = sensors.view(B * N_s, D)
-            # sensors_sa = self.sensor_self_attns[idx].step(sensors_sa)
-            sensors = sensors_sa.view(B, 1, N_s, D)
-        else:
-            sensors_sa = sensors.view(B * N_s, T, D)
-            # sensors_sa = self.sensor_self_attns[idx](sensors_sa)
-            sensors = sensors_sa.view(B, T, N_s, D)
-
         # Post-norm + feed-forward
         sensors = self.post_norms[idx + self.n_layers](sensors)
         sensors = sensors + self.ffns[idx + self.n_layers](sensors)
@@ -2008,8 +2014,8 @@ class TemporalDecoderHierarchical(nn.Module):
         # -----------------------------------------------------------
         # 4.  Importance masking
         # -----------------------------------------------------------
-        mask = (imp.unsqueeze(1).unsqueeze(-1) >= self.imp_threshold)  # [B, 1, N_s, 1]
-        sensors = sensors * mask.float()
+        # mask = (imp.unsqueeze(1).unsqueeze(-1) >= self.imp_threshold)  # [B, 1, N_s, 1]
+        # sensors = sensors * mask.float()
 
         return cls, sensors
 
@@ -2021,10 +2027,7 @@ class TemporalDecoderHierarchical(nn.Module):
             return self._block(idx, c, s, i, incremental=False)
         return cp.checkpoint(fn, cls, sensors, imp, use_reentrant=False)
 
-    # ------------------------------------------------------------------
-    # Parallel forward (teacher forcing)
-    # Parallel mode with hierarchical Heun
-    # ------------------------------------------------------------------
+
     def forward(self, x_seq: torch.Tensor, imp: torch.Tensor | None = None) -> torch.Tensor:
         """
         x_seq: [B, T, 1 + N_s, D]
@@ -2057,10 +2060,7 @@ class TemporalDecoderHierarchical(nn.Module):
 
         return torch.cat([cls_next, sensors_next], dim=2)  # [B, T, 1 + N_s, D]
 
-    # ------------------------------------------------------------------
-    # Autoregressive rollout with gradients (training)
-    # Autoregressive with teacher-forcing/truncation, hierarchical
-    # ------------------------------------------------------------------
+
     def rollout_with_grad(
         self,
         obs_window: torch.Tensor,  # [B, T_obs, 1 + N_s, D]
@@ -2106,7 +2106,9 @@ class TemporalDecoderHierarchical(nn.Module):
             cls_y, sensors_y = self._step_layers(
                 self._add_pos(cls_cur.unsqueeze(1), pos_idx).squeeze(1),
                 self._add_pos(sensors_cur.unsqueeze(1), pos_idx).squeeze(1),
-                imp)
+                imp,
+                append=True  # Append for k1
+            )
 
             k1_cls = self.cls_head(cls_y)                  # [B, 1, D]
             k1_sensors = self.sensor_head(sensors_y)       # [B, 1, N_s, D]
@@ -2117,11 +2119,13 @@ class TemporalDecoderHierarchical(nn.Module):
             cls_mid = cls_cur + dt_eff * k1_cls              # [B, 1, D]
             sensors_mid = sensors_cur + dt_eff * k1_sensors  # [B, N_s, D]
 
-            # Evaluate at midpoint
+            # Evaluate at midpoint (no append to avoid double-growth)
             cls_mid_y, sensors_mid_y = self._step_layers(
                 self._add_pos(cls_mid.unsqueeze(1), pos_idx).squeeze(1),
                 self._add_pos(sensors_mid.unsqueeze(1), pos_idx).squeeze(1),
-                imp)
+                imp,
+                append=False  # New: No-append for midpoint
+            )
 
             k2_cls = self.cls_head(cls_mid_y)              # [B, 1, D]
             k2_sensors = self.sensor_head(sensors_mid_y)   # [B, 1, N_s, D]
@@ -2145,9 +2149,11 @@ class TemporalDecoderHierarchical(nn.Module):
             # Truncated BPTT
             if truncate_k and ((step + 1) % truncate_k == 0):
                 for l in range(self.n_layers):
-                    # for attn in [self.cls_self_attns[l], self.cls_cross_attns[l],
-                    #              self.sensor_self_attns[l], self.sensor_cross_attns[l]]:
-                    for attn in [self.cls_self_attns[l], self.cls_cross_attns[l], self.sensor_cross_attns[l]]:
+                    for attn in [self.cls_self_attns[l], 
+                                 self.cls_cross_attns[l],
+                                #  self.sensor_self_attns[l], 
+                                 self.sensor_cross_attns[l]
+                                 ]:
                         if attn.K is not None:
                             attn.K = attn.K.detach()
                             attn.V = attn.V.detach()
@@ -2196,7 +2202,9 @@ class TemporalDecoderHierarchical(nn.Module):
             cls_y, sensors_y = self._step_layers(
                 self._add_pos(cls_cur.unsqueeze(1), pos_idx).squeeze(1),
                 self._add_pos(sensors_cur.unsqueeze(1), pos_idx).squeeze(1),
-                imp)
+                imp,
+                append=True  # Append for k1
+            )
 
             # k1
             k1_cls = self.cls_head(cls_y)                  # [B, 1, D]
@@ -2206,11 +2214,13 @@ class TemporalDecoderHierarchical(nn.Module):
             # Midpoint
             cls_mid = cls_cur + dt * k1_cls
             sensors_mid = sensors_cur + dt * k1_sensors
-            # Evaluate at midpoint
+            # Evaluate at midpoint (no append)
             cls_mid_y, sensors_mid_y = self._step_layers(
                 self._add_pos(cls_mid.unsqueeze(1), pos_idx).squeeze(1),
                 self._add_pos(sensors_mid.unsqueeze(1), pos_idx).squeeze(1),
-                imp)
+                imp,
+                append=False  # New: No-append for midpoint
+            )
             # k2
             k2_cls = self.cls_head(cls_mid_y)              # [B, 1, D]
             k2_sensors = self.sensor_head(sensors_mid_y)   # [B, 1, N_s, D]
@@ -2226,16 +2236,16 @@ class TemporalDecoderHierarchical(nn.Module):
         return torch.stack(out, 1)
 
     # ------------------------------------------------------------------
-    # Shared utilities (retained and adapted)
+    # Shared utilities
     # ------------------------------------------------------------------
     def _forward_no_ckpt(self, cls: torch.Tensor, sensors: torch.Tensor, imp: torch.Tensor) -> tuple:
         for idx in range(self.n_layers):
             cls, sensors = self._block(idx, cls, sensors, imp, incremental=False)
         return cls, sensors
 
-    def _step_layers(self, cls_t: torch.Tensor, sensors_t: torch.Tensor, imp: torch.Tensor) -> tuple:
+    def _step_layers(self, cls_t: torch.Tensor, sensors_t: torch.Tensor, imp: torch.Tensor, append: bool = True) -> tuple:
         for idx in range(self.n_layers):
-            cls_t, sensors_t = self._block(idx, cls_t, sensors_t, imp, incremental=True)
+            cls_t, sensors_t = self._block(idx, cls_t, sensors_t, imp, incremental=True, append=append)  # New: Pass append
         return cls_t, sensors_t
 
 # ================================================================
