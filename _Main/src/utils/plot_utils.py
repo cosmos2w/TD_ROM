@@ -246,7 +246,7 @@ def save_plot(
         if sensor_coords is not None and PLOT_SENSORS is True:
             ax_true.scatter(
                 sensor_coords[:, 0], sensor_coords[:, 1],
-                s=8, c="none", edgecolors="green", linewidths=0.8,
+                s=6, c="none", edgecolors="green", linewidths=0.6,
                 marker="o", zorder=4, label="sensors"
             )
             ax_true.legend(frameon=False, loc="upper right", fontsize=8)

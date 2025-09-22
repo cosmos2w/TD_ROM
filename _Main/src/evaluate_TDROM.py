@@ -587,7 +587,7 @@ def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time
                 if sensor_coords is not None:
                     ax_true.scatter(
                         sensor_coords[:, 0], sensor_coords[:, 1],
-                        s=28, c="none", edgecolors="red", linewidths=1.2,
+                        s=12, c="none", edgecolors="green", linewidths=1.2,
                         marker="o", zorder=4, label="sensors"
                     )
                     ax_true.legend(frameon=False, loc="upper right", fontsize=8)
@@ -701,12 +701,12 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        default="collinear_flow_Re40",
+        default="cylinder_flow",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=4, 
+    parser.add_argument('--indice', type=int, default=3, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=1, 
                         help='net checkpoint index: which stage')
@@ -715,11 +715,11 @@ def main():
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
 
-    parser.add_argument("--T_ini", type=int, default=800,
+    parser.add_argument("--T_ini", type=int, default=1800,
                         help="Initial time index from which to start prediction")
     parser.add_argument("--N_pred", type=int, default=128,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=16,
+    parser.add_argument("--num_space_sample", type=int, default=12,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,
@@ -727,11 +727,11 @@ def main():
     parser.add_argument("--Retain_Num", type=int, default=32,
                         help="Decide the number of topK important sensors")
     
-    parser.add_argument("--SAVE_GIF", action='store_true', default=False,
+    parser.add_argument("--SAVE_GIF", action='store_true', default=True,
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")
-    parser.add_argument("--seed", type=int, default=0,
+    parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     parser.add_argument("--plot_ids", type=int, nargs="*", default=None,
                    help="indices within the prediction window to plot "

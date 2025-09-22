@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="collinear_flow_Re40",
+        default="collinear_flow_Re100",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -126,14 +126,6 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             dt      = cfg["delta_t"],
         )
     elif cfg["decoder_type"] == "UD_Trans": # UD = uncertainty-driven
-        # decoder_lat = UncertaintyAwareTemporalDecoder(
-        #     d_model = cfg["F_dim"],
-        #     n_layers= cfg["num_layers_propagator"],
-        #     n_heads = cfg["num_heads"],
-        #     dt      = cfg["delta_t"],
-        #     unc_token_dim=cfg.get("unc_token_dim", 16),
-        #     gamma=cfg.get("gamma", 1.0)
-        # )
         decoder_lat = TemporalDecoderHierarchical(
             d_model = cfg["F_dim"],
             n_layers= cfg["num_layers_propagator"],
@@ -147,7 +139,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             d_model=cfg["F_dim"],
             num_heads=cfg["num_heads"],
             N_channels=N_c,
-            pe_module=encoder.embed['pos_embed'],
+            # pe_module=encoder.embed['pos_embed'],
             
             importance_scale=cfg["importance_scale"],
             bandwidth_init=cfg["bandwidth_init"], top_k=cfg["top_k"], per_sensor_sigma=cfg["per_sensor_sigma"], 
@@ -528,10 +520,16 @@ def train(cfg: dict):
                 coords_for_phi = Y[0]  # [N_pts, 2]
                 # ----------------------------------------
                 var_pred = torch.exp(out_logvar).detach() if out_logvar is not None else torch.zeros_like(out)
+
                 # pool over batch/time/channel
-                uncert = var_pred.mean(dim=(0,1,3))            # shape [N_pts]
+                # uncert = var_pred.mean(dim=(0,1,3))            # shape [N_pts]
+
+                # New: Hierarchical (per-batch mean, then max across batches)
+                uncert_batch = var_pred.mean(dim=(1,3))  # Mean over T/C per batch → [B, N_pts]
+                uncert = uncert_batch.max(dim=0)[0]      # Max over batches → [N_pts]
+
                 uncert = (uncert - uncert.min()) / (uncert.max() - uncert.min() + 1e-6)  # Normalize
-                uncert = uncert ** 2
+                uncert = uncert ** 1.5
 
                 # Compute spectral_uncert and blend with uncert
                 if stage == 0  : l_spectral = l_psd
@@ -944,8 +942,10 @@ def train(cfg: dict):
             # early-stopping & checkpoint
             if avg_test_loss_mse < best_test: 
                 best_test, epochs_no_imp = avg_test_loss_mse, 0
+            
             # if avg_train_loss_mse < best_test:
             #     best_test, epochs_no_imp = avg_train_loss_mse, 0
+
                 ckpt_dir = pathlib.Path(cfg["save_net_dir"]); ckpt_dir.mkdir(exist_ok=True, parents=True)
                 state_dict = (model.module if isinstance(model, nn.DataParallel) else model).state_dict()
                 torch.save(state_dict,
