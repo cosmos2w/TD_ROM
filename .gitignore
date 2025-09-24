@@ -13,6 +13,8 @@ Reaction_Diffusion/
 3D_GS_ReactionDiffusion/
 2D_CollinearPlateFlow/
 
+__pycache__/
+
 *.pth
 *.png
 *.gif

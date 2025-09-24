@@ -220,7 +220,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             d_model=cfg["F_dim"],
             num_heads=cfg["num_heads"],
             N_channels=N_c,
-            pe_module=encoder.embed['pos_embed'],
+            # pe_module=encoder.embed['pos_embed'],
             
             importance_scale=cfg["importance_scale"],
             bandwidth_init=cfg["bandwidth_init"], top_k=cfg["top_k"], per_sensor_sigma=cfg["per_sensor_sigma"], 
@@ -701,25 +701,25 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        default="cylinder_flow",
+        default="collinear_flow_Re100",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=3, 
+    parser.add_argument('--indice', type=int, default=1, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=1, 
                         help='net checkpoint index: which stage')
     parser.add_argument('--Repeat_id', type=int, default=0, 
                         help='Different propagator id sharing the same encoder and decoder')
+    
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
-
-    parser.add_argument("--T_ini", type=int, default=1800,
+    parser.add_argument("--T_ini", type=int, default=8000,
                         help="Initial time index from which to start prediction")
-    parser.add_argument("--N_pred", type=int, default=128,
+    parser.add_argument("--N_pred", type=int, default=48,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=12,
+    parser.add_argument("--num_space_sample", type=int, default=96,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,

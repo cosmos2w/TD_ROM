@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="collinear_flow_Re100",
+        default="channel_flow",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -76,7 +76,8 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     Use_Adaptive_Selection = cfg.get("Use_Adaptive_Selection", False)
     domain_decompose       = cfg.get('domain_decompose', False)
     CalRecVar              = cfg.get("CalRecVar", False)
-    retain_cls             = cfg.get("retain_cls", False)     
+    retain_cls             = cfg.get("retain_cls", False)
+    Use_imp_in_dyn         = cfg.get("Use_imp_in_dyn", False)
 
     if domain_decompose and cfg['pooling'] == 'none':
         encoder = DomainAdaptiveEncoder(
@@ -159,7 +160,8 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     if cfg["Use_Adaptive_Selection"] == True:
         net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec,
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"],
-                    use_adaptive_selection=Use_Adaptive_Selection, CalRecVar = CalRecVar, retain_cls = retain_cls)
+                    use_adaptive_selection = Use_Adaptive_Selection, CalRecVar = CalRecVar, 
+                    retain_cls = retain_cls, Use_imp_in_dyn = Use_imp_in_dyn)
     else:
         net = TD_ROM(encoder, decoder_lat, field_dec, 
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"])  
@@ -940,11 +942,11 @@ def train(cfg: dict):
                     plt.close()
 
             # early-stopping & checkpoint
-            if avg_test_loss_mse < best_test: 
-                best_test, epochs_no_imp = avg_test_loss_mse, 0
+            # if avg_test_loss_mse < best_test: 
+            #     best_test, epochs_no_imp = avg_test_loss_mse, 0
             
-            # if avg_train_loss_mse < best_test:
-            #     best_test, epochs_no_imp = avg_train_loss_mse, 0
+            if avg_train_loss_mse < best_test:
+                best_test, epochs_no_imp = avg_train_loss_mse, 0
 
                 ckpt_dir = pathlib.Path(cfg["save_net_dir"]); ckpt_dir.mkdir(exist_ok=True, parents=True)
                 state_dict = (model.module if isinstance(model, nn.DataParallel) else model).state_dict()

@@ -5,6 +5,7 @@ from __future__ import annotations
 from torchdiffeq import odeint
 from typing import Tuple, Callable, Optional
 from torch.utils.checkpoint import checkpoint
+from collections import deque
 
 import torch, torch.nn as nn, torch.nn.functional as F
 import torch.utils.checkpoint as cp
@@ -1568,7 +1569,7 @@ class CAU_MultiheadCrossAttention(nn.Module):
         if x.dim() == 4:
             # [B, T, N, D] -> flatten to [B, T*N, D]
             B, T, N, D = x.shape
-            xf = x.view(B, T * N, D)
+            xf = x.reshape(B, T * N, D)
             def restore(y):  # [B, T*N, D] -> [B, T, N, D]
                 return y.view(B, T, N, D)
             return xf, restore
@@ -1612,7 +1613,7 @@ class CAU_MultiheadCrossAttention(nn.Module):
             if key_value.dim() == 4:  # [B, T_kv, N_s, D] flattened -> [B, T_kv*N_s, D]
                 Bk, T_kv, N_s, _ = key_value.shape
                 assert Bk == B
-                assert imp_weights.shape == (B, N_s), f"imp_weights must be [B, N_s], got {imp_weights.shape}"
+                assert imp_weights.shape == (B, N_s), f"imp_weights must be [B, N_s]=[{B}, {N_s}], got {imp_weights.shape}"
                 imp_full = imp_weights.unsqueeze(1).expand(B, T_kv, N_s).reshape(B, T_kv * N_s)  # [B, T_kv*N_s]
             elif key_value.dim() == 3:
                 # If user provided [B, T_kv] we can use it; otherwise ignore
@@ -1712,7 +1713,7 @@ class CAU_MultiheadCrossAttention(nn.Module):
         return restore_q(out)
 
 # Main Class: TemporalDecoderHierarchical
-class TemporalDecoderHierarchical(nn.Module):
+class _TemporalDecoderHierarchical(nn.Module):
 
     def __init__(
         self,
@@ -2155,6 +2156,505 @@ class TemporalDecoderHierarchical(nn.Module):
             cls_t, sensors_t = self._block(idx, cls_t, sensors_t, imp, incremental=True, append=append)  # New: Pass append
         return cls_t, sensors_t
 
+# Revised 0922
+class TemporalDecoderHierarchical(nn.Module):
+
+    def __init__(
+        self,
+        d_model: int,
+        n_layers: int = 4,
+        n_heads: int = 4,
+        max_len: int = 4096,
+        dt: float = 0.02,
+        learnable_dt: bool = False,
+        dropout: float = 0.0,
+        rope_base: float = 1000.0,
+        checkpoint_every_layer: bool = True,
+        imp_threshold: float = 0.1,  # Mask if imp < threshold
+
+        n_window: int = 16,       # Fixed window size for history
+        pooling_kernel: int = 2,  # Kernel and stride for pooling
+        pooling_layers: int = 2,  # Number of pooling applications to compress (e.g., 64 -> 32 -> 16)
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.rope_base = rope_base
+        self.imp_threshold = imp_threshold
+        self.n_window = n_window
+        self.pooling_kernel = pooling_kernel
+        self.pooling_layers = pooling_layers
+
+        # Hierarchical layers (Stack n_layers of hierarchical blocks)
+        self.cls_self_attns     = nn.ModuleList([MultiheadSoftmaxAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
+        self.cls_cross_attns    = nn.ModuleList([CAU_MultiheadCrossAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
+        # self.sensor_self_attns  = nn.ModuleList([MultiheadSoftmaxAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
+        self.sensor_cross_attns = nn.ModuleList([CAU_MultiheadCrossAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
+
+        self.pre_norms  = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers * 2)])  # For CLS and sensors
+        self.post_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers * 2)])
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, 4 * d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(4 * d_model, d_model),
+            ) for _ in range(n_layers * 2)  # For CLS and sensors
+        ])
+
+        # Heun heads (separate for CLS and sensors)
+        self.cls_head    = nn.Linear(d_model, d_model)
+        self.sensor_head = nn.Linear(d_model, d_model)
+
+        # Learnable positional embedding (time)
+        self.pos_emb = nn.Parameter(torch.randn(max_len, d_model) * 0.02)
+
+        # Learnable spatial embedding for sensors (applied per-sensor)
+        self.spatial_emb = nn.Linear(d_model, d_model)  # Projects sensor features with spatial awareness
+
+        # Pooling layers (separate for CLS and sensors; avg and max, then combine)
+        self.cls_avg_pool = nn.AvgPool1d(kernel_size=pooling_kernel, stride=pooling_kernel)
+        self.cls_max_pool = nn.MaxPool1d(kernel_size=pooling_kernel, stride=pooling_kernel)
+        self.sensor_avg_pool = nn.AvgPool1d(kernel_size=pooling_kernel, stride=pooling_kernel)
+        self.sensor_max_pool = nn.MaxPool1d(kernel_size=pooling_kernel, stride=pooling_kernel)
+
+        # Post-transformer refinement (1D conv + FC, separate for CLS and sensors)
+        conv_dim = d_model  # Assuming after pooling, time dim is small
+        self.cls_conv = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1)
+        self.cls_fc = nn.Linear(d_model, d_model)
+        self.sensor_conv = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1)
+        self.sensor_fc = nn.Linear(d_model, d_model)
+
+        # dt handling 
+        self.register_buffer("dt_const", torch.tensor(dt))
+        if learnable_dt:
+            self.dt_scale = nn.Parameter(torch.zeros(()))
+        else:
+            self.dt_scale = None
+
+        self.use_ckpt = checkpoint_every_layer
+
+    def apply_rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """
+        Accepts:
+        x:  [B, T, M, D]  or [B, M, D] or [B, D]
+        pos: (1, T, 1) integer/float time indices
+        """
+        assert x.dim() in (2, 3, 4), f"apply_rope: unsupported x.dim={x.dim()}"
+        orig_dim = x.dim()
+
+        # Lift to 4D: [B, T, M, D]
+        if orig_dim == 2:          # [B, D] -> [B, 1, 1, D]
+            x = x.unsqueeze(1).unsqueeze(1)
+        elif orig_dim == 3:        # [B, M, D] -> [B, 1, M, D]
+            x = x.unsqueeze(1)
+        # else: already [B, T, M, D]
+
+        B, T, M, D = x.shape
+        assert D % 2 == 0, f"apply_rope: D must be even, got D={D}"
+        d = D // 2
+
+        # Frequencies and angles
+        freq = self.rope_base ** (-torch.arange(d, device=x.device, dtype=x.dtype) / d)  # [d]
+        # pos: [1, T, 1] -> [1, T, 1, 1], broadcast with freq -> [1, T, 1, d]
+        angle = pos.to(x.dtype).unsqueeze(-1) * freq.view(1, 1, 1, d)
+
+        s, c = angle.sin(), angle.cos()
+        x1, x2 = x[..., :d], x[..., d:]  # [B, T, M, d]
+        xr = torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)  # [B, T, M, D]
+
+        # Restore original rank
+        if orig_dim == 2: xr = xr.squeeze(1).squeeze(1)    # -> [B, D]
+        elif orig_dim == 3: xr = xr.squeeze(1)             # -> [B, M, D]
+
+        return xr
+
+    def _add_pos(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        """
+        Adds rotary position embeddings to x. Accepts x with shape:
+        - [B, T, M, D]  (T steps)
+        - [B, M, D]     (T=1)
+        - [B, D]        (T=1, M=1)
+        """
+        if x.dim() == 4:
+            T = x.shape[1]
+        elif x.dim() in (2, 3):
+            T = 1
+        else:
+            raise ValueError(f"_add_pos: unsupported x.dim={x.dim()}")
+        pos = torch.arange(offset, offset + T, device=x.device, dtype=x.dtype).view(1, T, 1)  # [1, T, 1]
+        return self.apply_rope(x, pos)
+
+    def _ensure_imp(self, imp, *, B: int, N_s: int, device, dtype=torch.float32):
+        if imp is None:
+            return torch.ones(B, N_s, device=device, dtype=dtype)
+        return imp
+
+    def _effective_dt(self):
+        if self.dt_scale is None:
+            return self.dt_const
+        return self.dt_const * F.softplus(self.dt_scale)
+
+    # ------------------------------------------------------------------
+    # Process window: Embeddings + Separate Pooling for CLS/Sensors
+    # ------------------------------------------------------------------
+    def _process_window(self, window: torch.Tensor, offset: int, imp: torch.Tensor) -> tuple:
+        """
+        window: [B, T_win, 1 + N_s, D]
+        Returns pooled cls and sensors: [B, T_pooled, 1, D] and [B, T_pooled, N_s, D]
+        """
+        B, T_win, M, D = window.shape
+        N_s = M - 1
+
+        # Add time embeddings (RoPE)
+        window = self._add_pos(window, offset)
+
+        # Separate CLS and sensors
+        cls_win = window[:, :, :1, :]      # [B, T, 1, D]
+        sensors_win = window[:, :, 1:, :]  # [B, T, N_s, D]
+
+        # Spatial embedding once (per time, per sensor)
+        sensors_win = self.spatial_emb(sensors_win)
+
+        # Apply pooling layers separately (multiple times to compress)
+        for _ in range(self.pooling_layers):
+            # Current time length (same for cls and sensors)
+            T_cur = cls_win.shape[1]
+            # If window is shorter than kernel, stop pooling
+            if T_cur < self.pooling_kernel:
+                break
+
+            # ---- CLS path ----
+            # [B, T_cur, 1, D] -> [B, D, T_cur]
+            cls_t = cls_win.squeeze(2).permute(0, 2, 1)        # [B, D, T_cur]
+            cls_avg = self.cls_avg_pool(cls_t)                 # [B, D, T_next]
+            cls_max = self.cls_max_pool(cls_t)                 # [B, D, T_next]
+            cls_pooled = (cls_avg + cls_max) / 2
+            # Back to [B, T_next, 1, D]
+            cls_win = cls_pooled.permute(0, 2, 1).unsqueeze(2) # [B, T_next, 1, D]
+
+            # ---- Sensors path ----
+            # sensors_win: [B, T_cur, N_s, D]
+            B_, T_cur_s, N_s_, D_ = sensors_win.shape
+            assert B_ == B and T_cur_s == T_cur and N_s_ == N_s and D_ == D, f"Unexpected sensors_win shape {sensors_win.shape}"
+
+            # Pool along time per sensor: [B*N_s, D, T_cur]
+            sensors_t = sensors_win.permute(0, 2, 3, 1).reshape(B * N_s, D, T_cur)
+            sensors_avg = self.sensor_avg_pool(sensors_t)      # [B*N_s, D, T_next]
+            sensors_max = self.sensor_max_pool(sensors_t)      # [B*N_s, D, T_next]
+            sensors_pooled = (sensors_avg + sensors_max) / 2   # [B*N_s, D, T_next]
+
+            # Back to [B, T_next, N_s, D]
+            T_next = sensors_pooled.shape[-1]
+            sensors_win = sensors_pooled.reshape(B, N_s, D, T_next).permute(0, 3, 1, 2)  # [B, T_next, N_s, D]
+
+        return cls_win, sensors_win
+
+    # ------------------------------------------------------------------
+    # Hierarchical Block (modified for parallel window processing, no incremental)
+    # ------------------------------------------------------------------
+    def _block(
+        self,
+        idx: int,
+        cls: torch.Tensor,
+        sensors: torch.Tensor,
+        imp: torch.Tensor,
+    ) -> tuple:
+        """
+        Modified for parallel: cls [B, T_pooled, 1, D], sensors [B, T_pooled, N_s, D]
+        Uses forward() of attentions instead of step().
+        """
+
+        # -----------------------------------------------------------
+        # 1.  Resolve shapes
+        # -----------------------------------------------------------
+        B, T, _, D = cls.shape
+        _, _, N_s, _ = sensors.shape
+
+        # -----------------------------------------------------------
+        # 2.  CLS stream
+        # -----------------------------------------------------------
+        cls_residual = cls
+        cls_normed = self.pre_norms[idx](cls)  # [B, T, 1, D]
+
+        cls_squeezed = cls_normed.squeeze(2)  # [B, T, D]
+        cls_attn = self.cls_self_attns[idx](cls_squeezed).unsqueeze(2)  # [B, T, 1, D]
+
+        cls_cross = self.cls_cross_attns[idx](cls_normed, sensors, imp_weights = imp)   # CLS attend to Sensors need imp
+        cls = cls_attn + cls_cross
+        
+        cls = self.post_norms[idx](cls_residual + cls)
+        cls = cls + self.ffns[idx](cls)
+
+        # -----------------------------------------------------------
+        # 3.  Sensor stream
+        # -----------------------------------------------------------
+        sensors = self.pre_norms[idx + self.n_layers](sensors)  # [B, T, N_s, D]
+
+        sensors_sa = sensors.view(B * N_s, T, D)  # [B*N_s, T, D]
+        # sensors_sa = self.sensor_self_attns[idx](sensors_sa)  # Uncomment if needed
+        sensors = sensors_sa.view(B, T, N_s, D)
+
+        sensors = sensors + self.sensor_cross_attns[idx](sensors, cls, imp_weights = None) # Sensor attend to CLS do not need imp
+
+        sensors = self.post_norms[idx + self.n_layers](sensors)
+        sensors = sensors + self.ffns[idx + self.n_layers](sensors)
+
+        # -----------------------------------------------------------
+        # 4.  Importance masking
+        # -----------------------------------------------------------
+        # mask = (imp.unsqueeze(1).unsqueeze(-1) >= self.imp_threshold)  # [B, 1, N_s, 1]
+        # sensors = sensors * mask.float().unsqueeze(1)  # Broadcast over T
+
+        return cls, sensors
+
+    def _block_ckpt(self, idx: int, cls: torch.Tensor, sensors: torch.Tensor, imp: torch.Tensor) -> tuple:
+        if not (self.use_ckpt and self.training):
+            return self._block(idx, cls, sensors, imp)
+
+        def fn(c, s, i):
+            return self._block(idx, c, s, i)
+        return cp.checkpoint(fn, cls, sensors, imp, use_reentrant=False)
+
+    # ------------------------------------------------------------------
+    # Post-transformer refinement (conv + fc, separate for CLS/sensors)
+    # ------------------------------------------------------------------
+    def _refine(self, cls: torch.Tensor, sensors: torch.Tensor) -> tuple:
+        """
+        cls:     [B, T, 1, D] -> [B, T, 1, D]
+        sensors: [B, T, N_s, D] -> [B, T, N_s, D]
+        """
+        B, T, _, D = cls.shape
+        _, T2, N_s, D2 = sensors.shape
+        assert T2 == T and D2 == D, f"Shape mismatch: cls T={T}, sensors T={T2}; D={D}, sensors D={D2}"
+
+        # ---- CLS path ----
+        cls_t = cls.squeeze(2).permute(0, 2, 1)          # [B, D, T]
+        cls_ref = F.relu(self.cls_conv(cls_t))           # [B, D, T]
+        cls_ref = cls_ref.permute(0, 2, 1).unsqueeze(2)  # [B, T, 1, D]
+        cls_ref = self.cls_fc(cls_ref)                   # [B, T, 1, D]
+
+        # ---- Sensors path ----
+        # [B, T, N_s, D] -> [B*N_s, D, T]
+        sensors_t = sensors.permute(0, 2, 3, 1).reshape(B * N_s, D, T)
+        sensors_ref = F.relu(self.sensor_conv(sensors_t))    # [B*N_s, D, T]
+
+        # Back to [B, T, N_s, D]
+        sensors_ref = sensors_ref.permute(0, 2, 1)           # [B*N_s, T, D]
+        sensors_ref = sensors_ref.reshape(B, N_s, T, D)      # [B, N_s, T, D]
+        sensors_ref = sensors_ref.permute(0, 2, 1, 3)        # [B, T, N_s, D]
+        sensors_ref = self.sensor_fc(sensors_ref)            # [B, T, N_s, D]
+
+        return cls_ref, sensors_ref
+
+    def forward(self, x_seq: torch.Tensor, imp: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        x_seq: [B, T, 1 + N_s, D]
+        imp: [B, N_s]
+        """
+        B, T, M, D = x_seq.shape
+        N_s = M - 1
+
+        imp = self._ensure_imp(imp, B=B, N_s=N_s, device=x_seq.device, dtype=x_seq.dtype)
+
+        # Treat full x_seq as "window"
+        cls_pooled, sensors_pooled = self._process_window(x_seq, 0, imp)
+
+        for idx in range(self.n_layers):
+            cls_pooled, sensors_pooled = self._block_ckpt(idx, cls_pooled, sensors_pooled, imp)
+
+        # Refine
+        cls_pooled, sensors_pooled = self._refine(cls_pooled, sensors_pooled)
+
+        # Hierarchical Heun
+        dt = self._effective_dt()
+        k1_cls = self.cls_head(cls_pooled)
+        k1_sensors = self.sensor_head(sensors_pooled)
+        cls_mid = cls_pooled + dt * k1_cls
+        sensors_mid = sensors_pooled + dt * k1_sensors
+        # Pass mid through no-ckpt forward (re-process mid as mini-window of size 1)
+        cls_mid, sensors_mid = self._forward_no_ckpt(cls_mid, sensors_mid, imp)
+        cls_mid, sensors_mid = self._refine(cls_mid, sensors_mid)
+        k2_cls = self.cls_head(cls_mid)
+        k2_sensors = self.sensor_head(sensors_mid)
+        cls_next = cls_pooled + 0.5 * dt * (k1_cls + k2_cls)
+        sensors_next = sensors_pooled + 0.5 * dt * (k1_sensors + k2_sensors)
+
+        return torch.cat([cls_next, sensors_next], dim=2)  # [B, T_pooled, 1 + N_s, D] (note: output T may be compressed)
+
+    def rollout_with_grad(
+        self,
+        obs_window: torch.Tensor,  # [B, T_obs, 1 + N_s, D]
+        N_fore: int,
+        imp: torch.Tensor | None = None,  # [B, N_s]
+        *,
+        truncate_k: int | None = 64,
+        teacher_force_seq: torch.Tensor | None = None,
+        teacher_force_prob: float = 0.0,
+    ) -> torch.Tensor:
+        assert self.training, "Call only in training mode"
+        B, T_obs, M, D = obs_window.shape
+        N_s = M - 1
+        dev = obs_window.device
+        imp = self._ensure_imp(imp, B=B, N_s=N_s, device=obs_window.device, dtype=obs_window.dtype)
+
+        # Initialize rolling window as deque (maxlen=n_window)
+        history = deque(maxlen=self.n_window)
+        for t in range(T_obs):
+            history.append(obs_window[:, t])  # [B, 1 + N_s, D]
+
+        outputs = [torch.stack(list(history), dim=1)] if len(history) > 0 else []  # Initial outputs from obs
+
+        dt_eff = self._effective_dt()
+        steps_left = N_fore - T_obs
+        latent_cur = history[-1] if history else torch.zeros(B, 1 + N_s, D, device=dev)  # Fallback
+        cls_cur = latent_cur[:, :1, :]
+        sensors_cur = latent_cur[:, 1:, :]
+
+        for step in range(steps_left):
+            # Extract current window [B, min(n_window, len(history)), 1 + N_s, D]
+            win_tensor = torch.stack(list(history), dim=1) if len(history) > 0 else latent_cur.unsqueeze(1)
+            pos_offset = T_obs + step - win_tensor.shape[1] + 1  # Align positions
+
+            # Process window
+            cls_win, sensors_win = self._process_window(win_tensor, pos_offset, imp)
+
+            # Hierarchical blocks on pooled window
+            for idx in range(self.n_layers):
+                cls_win, sensors_win = self._block_ckpt(idx, cls_win, sensors_win, imp)
+
+            # Refine
+            cls_y, sensors_y = self._refine(cls_win, sensors_win)
+
+            # Heun k1 (use last time step of refined as y)
+            k1_cls = self.cls_head(cls_y[:, -1:, :, :]).squeeze(1) # [B, 1, D]
+            k1_sensors = self.sensor_head(sensors_y[:, -1:, :, :]).squeeze(1) # [B, N_s, D]
+
+            # Midpoint (treat as single-step window)
+            cls_mid_token = cls_cur + dt_eff * k1_cls # [B, 1, D]
+            sensors_mid_token = sensors_cur + dt_eff * k1_sensors # [B, N_s, D]
+            mid_window = torch.cat([cls_mid_token, sensors_mid_token], dim=1).unsqueeze(1) # [B, 1, 1+N_s, D]
+
+            cls_mid, sensors_mid = self._process_window(mid_window, pos_offset + win_tensor.shape[1] - 1, imp)
+            for idx in range(self.n_layers):
+                cls_mid, sensors_mid = self._block_ckpt(idx, cls_mid, sensors_mid, imp)
+            cls_mid_y, sensors_mid_y = self._refine(cls_mid, sensors_mid)
+
+            k2_cls = self.cls_head(cls_mid_y[:, -1:, :, :]).squeeze(1) # [B, 1, D]
+            k2_sensors = self.sensor_head(sensors_mid_y[:, -1:, :, :]).squeeze(1) # [B, N_s, D]
+
+            # Heun update
+            cls_next = cls_cur + 0.5 * dt_eff * (k1_cls + k2_cls) # [B, 1, D]
+            sensors_next = sensors_cur + 0.5 * dt_eff * (k1_sensors + k2_sensors) # [B, N_s, D]
+            latent_next = torch.cat([cls_next, sensors_next], dim=1) # [B, 1 + N_s, D]
+
+            # Append to outputs and history
+            # outputs.append(latent_next)
+            outputs.append(latent_next.unsqueeze(1)) # [B, 1, 1+N_s, D]
+            history.append(latent_next)
+
+            # Teacher forcing
+            use_tf = (teacher_force_seq is not None and step < teacher_force_seq.size(1) and
+                      torch.rand((), device=dev) < teacher_force_prob)
+            if use_tf:
+                history[-1] = teacher_force_seq[:, step]  # Override last in history
+
+            # Truncated BPTT (simulate by detaching history every truncate_k steps)
+            if truncate_k and ((step + 1) % truncate_k == 0):
+                history = deque([h.detach() for h in history], maxlen=self.n_window)
+
+            # Update current
+            latent_cur = history[-1]
+            cls_cur = latent_cur[:, :1, :]
+            sensors_cur = latent_cur[:, 1:, :]
+
+        # return torch.stack(outputs, 1)  # [B, N_fore, 1 + N_s, D]
+        return torch.cat(outputs, dim=1) # [B, T_obs + steps_left, 1+N_s, D]
+
+    # ------------------------------------------------------------------
+    # Greedy generation (no grad) – evaluation / inference
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def generate(self, obs_window: torch.Tensor, N_fore: int, imp: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        obs_window: [B, T_obs, 1 + N_s, D]
+        imp: [B, N_s]
+        returns: [B, T_obs + steps_left, 1 + N_s, D]  (same as training; slice if you only want forecasts)
+        """
+        B, T_obs, M, D = obs_window.shape
+        N_s = M - 1
+        dev = obs_window.device
+        imp = self._ensure_imp(imp, B=B, N_s=N_s, device=obs_window.device, dtype=obs_window.dtype)
+
+        # Rolling window seeded with observed tokens
+        history = deque(maxlen=self.n_window)
+        for t in range(T_obs):
+            history.append(obs_window[:, t])  # [B, 1 + N_s, D]
+
+        # Collect outputs as time-major blocks; start with observed segment
+        outputs = [torch.stack(list(history), dim=1)] if len(history) > 0 else []
+
+        dt = self._effective_dt()
+        steps_left = N_fore - T_obs
+
+        latent_cur = history[-1] if history else torch.zeros(B, 1 + N_s, D, device=dev, dtype=obs_window.dtype)
+        cls_cur = latent_cur[:, :1, :]      # [B, 1, D]
+        sensors_cur = latent_cur[:, 1:, :]  # [B, N_s, D]
+
+        for step in range(steps_left):
+            # Current window [B, T_win, 1 + N_s, D]
+            win_tensor = torch.stack(list(history), dim=1) if len(history) > 0 else latent_cur.unsqueeze(1)
+            pos_offset = T_obs + step - win_tensor.shape[1] + 1
+
+            # Context processing
+            cls_win, sensors_win = self._process_window(win_tensor, pos_offset, imp)
+            for idx in range(self.n_layers):
+                cls_win, sensors_win = self._block(idx, cls_win, sensors_win, imp)  # no checkpoint in no_grad
+            cls_y, sensors_y = self._refine(cls_win, sensors_win)
+
+            # Heun k1 from last pooled timestep (reduce to single step for the ODE state)
+            k1_cls = self.cls_head(cls_y[:, -1:, :, :]).squeeze(1)           # [B, 1, D]
+            k1_sensors = self.sensor_head(sensors_y[:, -1:, :, :]).squeeze(1) # [B, N_s, D]
+
+            # Midpoint: build a one-step window explicitly [B, 1, 1+N_s, D]
+            cls_mid_token = cls_cur + dt * k1_cls                 # [B, 1, D]
+            sensors_mid_token = sensors_cur + dt * k1_sensors     # [B, N_s, D]
+            mid_window = torch.cat([cls_mid_token, sensors_mid_token], dim=1).unsqueeze(1)  # [B, 1, 1+N_s, D]
+
+            cls_mid, sensors_mid = self._process_window(mid_window, pos_offset + win_tensor.shape[1] - 1, imp)
+            for idx in range(self.n_layers):
+                cls_mid, sensors_mid = self._block(idx, cls_mid, sensors_mid, imp)
+            cls_mid_y, sensors_mid_y = self._refine(cls_mid, sensors_mid)
+
+            # Heun k2 (also single-step)
+            k2_cls = self.cls_head(cls_mid_y[:, -1:, :, :]).squeeze(1)           # [B, 1, D]
+            k2_sensors = self.sensor_head(sensors_mid_y[:, -1:, :, :]).squeeze(1) # [B, N_s, D]
+
+            # Heun update on single-step state
+            cls_next = cls_cur + 0.5 * dt * (k1_cls + k2_cls)              # [B, 1, D]
+            sensors_next = sensors_cur + 0.5 * dt * (k1_sensors + k2_sensors)  # [B, N_s, D]
+            latent_next = torch.cat([cls_next, sensors_next], dim=1)       # [B, 1 + N_s, D]
+
+            # Append to outputs and update buffers
+            outputs.append(latent_next.unsqueeze(1))  # [B, 1, 1+N_s, D]
+            history.append(latent_next)
+
+            # Advance current state
+            cls_cur = cls_next
+            sensors_cur = sensors_next
+
+        # Concatenate time blocks: [B, T_obs + steps_left, 1 + N_s, D]
+        return torch.cat(outputs, dim=1)
+
+    # ------------------------------------------------------------------
+    # Shared utilities
+    # ------------------------------------------------------------------
+    def _forward_no_ckpt(self, cls: torch.Tensor, sensors: torch.Tensor, imp: torch.Tensor) -> tuple:
+        for idx in range(self.n_layers):
+            cls, sensors = self._block(idx, cls, sensors, imp)
+        return cls, sensors
+
 # ================================================================
 # Temporal Decoder Adapter for all modules
 # ================================================================
@@ -2169,6 +2669,7 @@ class TemporalDecoderAdapter(nn.Module):
         N_Fore            : int,
         N_window          : int,
         *,
+        imp: torch.Tensor | None = None,       # [B, N_s]
         truncate_k        : int | None = 32,
         teacher_force_seq : torch.Tensor | None = None,
         teacher_force_prob: float = 0.0,
@@ -2178,13 +2679,23 @@ class TemporalDecoderAdapter(nn.Module):
         Call this only with model.train() set.
         """
         assert self.training, "Use only in training mode"
-        output = self.core.rollout_with_grad(
-            obs_window        = G_latent[:, :N_window],
-            N_fore            = N_Fore,
-            truncate_k        = truncate_k,
-            teacher_force_seq = teacher_force_seq,
-            teacher_force_prob= teacher_force_prob,
-        )
+        if imp is not None:
+            output = self.core.rollout_with_grad(
+                obs_window        = G_latent[:, :N_window],
+                N_fore            = N_Fore,
+                imp               = imp,
+                truncate_k        = truncate_k,
+                teacher_force_seq = teacher_force_seq,
+                teacher_force_prob= teacher_force_prob,
+            )
+        else:
+            output = self.core.rollout_with_grad(
+                obs_window        = G_latent[:, :N_window],
+                N_fore            = N_Fore,
+                truncate_k        = truncate_k,
+                teacher_force_seq = teacher_force_seq,
+                teacher_force_prob= teacher_force_prob,
+            )            
         # Handle if output is (traj, traj_logvar) or just traj
         if isinstance(output, tuple) and len(output) == 2:
             return output  # (traj, traj_logvar)
@@ -2193,9 +2704,17 @@ class TemporalDecoderAdapter(nn.Module):
         else:
             raise ValueError(f"Unexpected output from core.rollout_with_grad: {type(output)}")
 
-    def forward(self, G_latent: torch.Tensor, N_Fore: int, N_window: int):
+    def forward(
+            self, G_latent: torch.Tensor, 
+            N_Fore: int, 
+            N_window: int, 
+            imp: torch.Tensor | None = None,  # [B, N_s]
+            ):
         
-        output = self.core.generate(G_latent[:, :N_window], N_Fore)
+        if imp is not None:
+            output = self.core.generate(G_latent[:, :N_window], N_Fore, imp)
+        else:
+            output = self.core.generate(G_latent[:, :N_window], N_Fore)
         
         # Handle if output is (traj, traj_logvar) or just traj
         if isinstance(output, tuple) and len(output) == 2:
@@ -2812,6 +3331,7 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         phi   = phi_mean.detach()                                       # [B,S]
         gamma = self.importance_scale
         d_scaled = d / (phi[:, None, :] ** gamma + 1e-6)                # [B,P,S]
+        # d_scaled = d 
 
         # ------------------------------------------------------------
         # Unified top-k aggregation (K_eff = min(K, number_of_valid_sensors))
@@ -2829,8 +3349,8 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         d_k = torch.gather(d_scaled, 2, top_idx)                        # (B,P,K_eff)
 
         # Gather phi and per-sensor sigma (if used) at the same indices
-        phi_exp = phi[:, None, :].expand(-1, P, -1)                     # (B,P,S)
-        phi_k   = torch.gather(phi_exp, 2, top_idx)                     # (B,P,K_eff)
+        phi_expan = phi[:, None, :].expand(-1, P, -1)                     # (B,P,S)
+        phi_k     = torch.gather(phi_expan, 2, top_idx)                   # (B,P,K_eff)
 
         if self.per_sensor_sigma:
             sigma_k = sigma[top_idx]                                     # (B,P,K_eff)
@@ -2865,12 +3385,24 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
         # ------------------------------------------------------------------------------
 
-        # local_lat = self.cross_attn(coord_tok, lat, lat)
-        if self.use_checkpoint:
-            local_lat = checkpoint(self.cross_attn, coord_tok, lat, lat,
-                                   use_reentrant=False, preserve_rng_state=False)
+        # if self.use_checkpoint:
+        #     local_lat = checkpoint(self.cross_attn, coord_tok, lat, lat,
+        #                            use_reentrant=False, preserve_rng_state=False)
+        # else:
+        #     local_lat = self.cross_attn(coord_tok, lat, lat)
+
+        if hasattr(self.cross_attn, 'to_v'):
+            v_proj  = self.cross_attn.to_v
+            out_proj = self.cross_attn.out
         else:
-            local_lat = self.cross_attn(coord_tok, lat, lat)
+            mha = self.cross_attn.attn
+            dim = mha.embed_dim
+            v_weight = mha.in_proj_weight[2 * dim : 3 * dim]
+            v_bias   = mha.in_proj_bias[2 * dim : 3 * dim] if mha.in_proj_bias is not None else None
+            def v_proj(x): return F.linear(x, v_weight, v_bias)
+            out_proj = mha.out_proj
+        
+        local_lat = out_proj(v_proj(lat))  # [B*T,P,d]
         local_pre = coord_tok + local_lat
         local_x = self.norm(local_pre)
 
@@ -3008,6 +3540,7 @@ class TD_ROM_Bay_DD(nn.Module):
                  use_adaptive_selection: bool  = False,
                  CalRecVar             : bool  = False, 
                  retain_cls            : bool  = False, 
+                 Use_imp_in_dyn        : bool  = False,
                  ):
 
         super().__init__()
@@ -3019,6 +3552,7 @@ class TD_ROM_Bay_DD(nn.Module):
         self.TemporalDecoderAdapter = TemporalDecoderAdapter(temporaldecoder)
         self.decoder                = fielddecoder
         self.retain_cls             = retain_cls
+        self.Use_imp_in_dyn         = Use_imp_in_dyn
 
         self.delta_t                = delta_t
         self.N_window               = N_window
@@ -3111,10 +3645,14 @@ class TD_ROM_Bay_DD(nn.Module):
             latent_traj_logvar = None
         else:
             # --- Integrate the latent dynamics ---------------------------------
+
+            imp = original_phi.detach() if self.Use_imp_in_dyn is True else None
+
             if self.training:
                 output = self.TemporalDecoderAdapter.forward_autoreg(
                     G_latent           = latent_seed,
                     N_Fore             = T_full,
+                    imp                = imp,
                     N_window           = self.N_window,
                     teacher_force_seq  = None,      # ground truth tokens
                     teacher_force_prob = teacher_force_prob,
@@ -3124,7 +3662,9 @@ class TD_ROM_Bay_DD(nn.Module):
                 output = self.TemporalDecoderAdapter(
                     G_latent = latent_seed,
                     N_Fore   = T_full,
-                    N_window = self.N_window)
+                    N_window = self.N_window,
+                    imp      = imp,
+                    )
             latent_traj, latent_traj_logvar = output
 
         if is_multi_token and self.cfg.get('decoder_type', "CausalTrans") != "UD_Trans":
@@ -3139,14 +3679,13 @@ class TD_ROM_Bay_DD(nn.Module):
 
         G_u_mean_Sens = G_u_logvar_Sens = None
         G_u_mean = G_u_logvar = None
-        if self.CalRecVar:
 
-            G_u_cls, G_u_mean, G_u_logvar = self.decoder(latent_traj, Y, sensor_coords=sensor_coords_from_encoder, 
-                    mask=mask_from_encoder[:, -1:] if mask_from_encoder.dim() > 1 else mask_from_encoder, phi_mean=phi_mean) 
-            
-            if self.Supervise_Sensors:  # Only decode the values at the sensors's locations
-                G_u_cls_sens, G_u_mean_Sens, G_u_logvar_Sens = self.decoder(latent_traj, sensor_coords_from_encoder, sensor_coords=sensor_coords_from_encoder, 
-                        mask=mask_from_encoder[:, -1:] if mask_from_encoder.dim() > 1 else mask_from_encoder, phi_mean=phi_mean)
+        G_u_cls, G_u_mean, G_u_logvar = self.decoder(latent_traj, Y, sensor_coords=sensor_coords_from_encoder, 
+                mask=mask_from_encoder[:, -1:] if mask_from_encoder.dim() > 1 else mask_from_encoder, phi_mean=phi_mean) 
+        
+        if self.Supervise_Sensors:  # Only decode the values at the sensors's locations
+            G_u_cls_sens, G_u_mean_Sens, G_u_logvar_Sens = self.decoder(latent_traj, sensor_coords_from_encoder, sensor_coords=sensor_coords_from_encoder, 
+                    mask=mask_from_encoder[:, -1:] if mask_from_encoder.dim() > 1 else mask_from_encoder, phi_mean=phi_mean)
 
         return (G_u_mean, G_u_logvar, 
                 G_obs, latent_traj, latent_traj_logvar, 
