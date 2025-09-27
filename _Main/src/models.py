@@ -112,7 +112,7 @@ class FourierEmbedding(nn.Module):
         proj = 2.0 * math.pi * xy @ self.B          # (..., M)
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
-class CrossAttention(nn.Module):
+class _CrossAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
         self.attn = nn.MultiheadAttention(dim,
@@ -122,6 +122,42 @@ class CrossAttention(nn.Module):
     def forward(self, q, k, v):
         y, _ = self.attn(q, k, v, need_weights=False)
         return y
+
+class CrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        layers: int = 1,               # number of repeated applications
+        use_layernorm: bool = False,   # stability when layers > 1
+        residual: bool = False,        # q + attn_out
+    ):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.layers = layers
+        self.residual = residual
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.norm = nn.LayerNorm(dim) if use_layernorm else nn.Identity()
+
+    def forward(self, q, k, v):
+        """
+        q: (B, Tq, C), k: (B, Tk, C), v: (B, Tk, C)
+        returns: (B, Tq, C)
+        """
+        x = q
+        for _ in range(self.layers):
+            out, _ = self.attn(x, k, v, need_weights=False)
+            if self.residual:
+                out = x + self.dropout(out)
+            out = self.norm(out)
+            x = out
+        return x
 
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
@@ -353,12 +389,16 @@ class DomainAdaptiveEncoder(nn.Module):
         self.latents = build_latent_bank(All_dim, latent_tokens, with_cls=True)
 
         # 3. Attention blocks ----------------------------------------------------
-        self.cross_attn            = CrossAttention(All_dim, num_heads, dropout=0.0)
+        self.cross_attn            = CrossAttention(All_dim, num_heads, dropout = 0.0,
+                                                    layers = latent_layers
+                                                    )
         self.cross_norm            = nn.RMSNorm(All_dim)
         self.cross_latent_mixer    = build_transformer_stack(All_dim, num_heads,
                                                              latent_layers)
 
-        self.token_to_latent       = CrossAttention(All_dim, num_heads, dropout=0.0)
+        self.token_to_latent       = CrossAttention(All_dim, num_heads, dropout = 0.0,
+                                                    layers = latent_layers
+                                                    )
         self.token_to_latent_norm  = nn.RMSNorm(All_dim)
         self.token_to_latent_mixer = build_transformer_stack(All_dim, num_heads,
                                                              latent_layers)
@@ -393,20 +433,23 @@ class DomainAdaptiveEncoder(nn.Module):
 
         # ------------------------------------------------------------------ 
         # Prepare latent + CLS tokens
-        cls = self.latents['cls_token'].expand(B * T, 1, -1)                   # (B*T,1,D)
-        lat = self.latents['latent_param'].expand(B * T, -1, -1)               # (B*T,L,D)
-        lat = torch.cat([cls, lat], dim=1)                                     # (B*T,1+L,D)
+        if self.retain_cls:
+            cls = self.latents['cls_token'].expand(B * T, 1, -1)                   # (B*T,1,D)
+            lat = self.latents['latent_param'].expand(B * T, -1, -1)               # (B*T,L,D)
+            lat = torch.cat([cls, lat], dim=1)                                     # (B*T,1+L,D)
 
         # Cross-attention: sensor tokens -> latent tokens
         lat = self.cross_norm(lat)
-        lat = self.cross_attn(lat, tok_flat, tok_flat)
+        lat = lat + self.cross_attn(lat, tok_flat, tok_flat)
         lat = lat + self.cross_latent_mixer(lat)
 
         # ------------------------------------------------------------------ 
         # Feed refined latent information back into sensor tokens
         tok_flat_up  = self.token_to_latent_norm(tok_flat)
-        tok_flat_up  = self.token_to_latent(tok_flat_up, lat, lat)
+        tok_flat_up  = tok_flat_up + self.token_to_latent(tok_flat_up, lat, lat)
         tok_flat_out = tok_flat_up + self.token_to_latent_mixer(tok_flat_up)
+
+        # tok_flat_out = tok_flat_up + self.token_to_latent(tok_flat_up, lat, lat)
 
         # ------------------------------------------------------------------ 
         # Optionally keep CLS as part of the output token set
@@ -2894,256 +2937,6 @@ class PerceiverReconstructor(nn.Module):
 # ---------------------------------------------------------------------
 # Domain Adaptive Reconstructor with soft boundaries
 # ---------------------------------------------------------------------
-class _SoftDomainAdaptiveReconstructor(PerceiverReconstructor):
-
-    def __init__(
-        self,
-        *args,
-        # --- former DomainAdaptiveReconstructor arguments --------------
-
-        overlap_ratio:   float = 0.05,
-        importance_scale: float = 0.50,
-
-        # --- specific to SoftDomainAdaptiveReconstructor --------------
-        bandwidth_init:    float = 0.05,
-        top_k:             int | None = None,
-        per_sensor_sigma:  bool  = False,
-        CalRecVar       :  bool  = False, 
-        retain_cls      :  bool = False,
-
-        **kwargs,
-    ):
-        """
-        The positional/keyword behaviour is identical to the old
-        implementation; extra keywords are silently forwarded to the
-        PerceiverReconstructor constructor through **kwargs.
-        """
-        super().__init__(*args, **kwargs)
-
-        self.overlap_ratio    = overlap_ratio
-        self.importance_scale = importance_scale
-        self.CalRecVar        = CalRecVar
-
-        d_model = self.lat_proj.out_features
-
-        self.block_size        = 256         
-        self.top_k             = top_k
-        self.per_sensor_sigma  = per_sensor_sigma
-        self.register_parameter("log_sigma", None)  
-        self.bandwidth_init    = bandwidth_init
-        self._prev_S           = None
-
-        self.coord_norm = nn.RMSNorm(d_model)
-        self.agg_norm   = nn.RMSNorm(d_model)
-        self.mlp_norm   = nn.RMSNorm(d_model)
-
-        # flag for retaining CLS and hierarchical reconstruction
-        self.retain_cls = retain_cls
-        print(f'self.retain_cls is {self.retain_cls}')
-        if self.retain_cls: 
-            self.fusion_proj = nn.Linear(2 * d_model, d_model)  # Projects concatenated [local + CLS] back to d_model
-
-        if CalRecVar:
-            self.stats_dim = 4  # mean_d, std_d, effective_K, mean_phi
-            self.stats_proj = nn.Linear(self.stats_dim, 16)  # Project to embed dim; concatenate to x
-            self.var_head = nn.Linear(self.d_model + 16, self.N_channels)  # Input now larger
-
-    @staticmethod
-    @torch.jit.ignore
-    def _topk_aggregate(lat_proj:  torch.Tensor,   # (B,T,S,D)
-                        top_idx:   torch.Tensor,   # (B,P,K)
-                        weights_k: torch.Tensor,   # (B,P,K)
-
-                        CalRecVar : bool,
-                        d_k: torch.Tensor,         # Pass d_k (B,P,K)
-                        phi_k: torch.Tensor,       # Pass gathered phi (B,P,K); phi expanded per query
-                        valid_k: torch.Tensor,     # Pass valid (B,P,K)
-
-                        S: int) -> torch.Tensor:
-        """
-        Return h[b,t,p] = Σ_k w[b,p,k] · φ[b,t, top_idx[b,p,k], :]
-        More memory-friendly than the previous gather-loop
-        Also return h and per-query stats [mean_d, std_d, effective_K, mean_phi] (B,P,4)
-        """
-        B, T, _, D = lat_proj.shape
-        _, P, K    = top_idx.shape
-        dev        = lat_proj.device
-
-        w = torch.zeros(B, P, S, device=dev, dtype=lat_proj.dtype)
-        w.scatter_(2, top_idx, weights_k)           # write K weights per query
-    
-        if CalRecVar == True:
-            h = torch.einsum('btsd,bps->btpd', lat_proj, w)
-
-            mask = valid_k.float()
-            effective_K = mask.sum(dim=-1, keepdim=True)  # (B,P,1) number of valid sensors per query
-
-            # Weighted mean/std for d_k and phi_k (using weights_k)
-            mean_d = (d_k * weights_k * mask).sum(dim=-1, keepdim=True) / (effective_K + 1e-6)  
-            var_d = ((d_k - mean_d)**2 * weights_k * mask).sum(dim=-1, keepdim=True) / (effective_K + 1e-6)
-            std_d = torch.sqrt(var_d + 1e-6)  
-            mean_phi = (phi_k * weights_k * mask).sum(dim=-1, keepdim=True) / (effective_K + 1e-6)  
-
-            stats = torch.cat([mean_d, std_d, effective_K, mean_phi], dim=-1)  
-            return h, stats
-        else:
-            return torch.einsum('btsd,bps->btpd', lat_proj, w)
-
-    def forward(self,
-                z: torch.Tensor,                # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
-                Y: torch.Tensor,                # [B, P, 2/3]
-                sensor_coords: torch.Tensor,    # [B, S, 2/3]
-                mask: torch.Tensor,             # [B, T, S] (if retain_cls=True, this is for S+1; we slice below)
-                phi_mean: torch.Tensor | None = None,
-
-                padding_mask: torch.Tensor | None = None
-                ) -> torch.Tensor:
-
-        B, T, S_or_Sp1, D_raw = z.shape
-        P              = Y.size(1)
-        C              = self.N_channels
-        dev            = z.device
-        d_model        = self.lat_proj.out_features
-
-        S = sensor_coords.size(1)  # true number of sensors (excludes CLS)
-
-        if phi_mean is None: phi_mean = torch.ones(B, S, device=dev)  # [B,S]
-
-        if self.per_sensor_sigma:
-            if (self.log_sigma is None) or (self.log_sigma.numel() != S):
-                self.log_sigma = nn.Parameter(torch.full((S,),
-                                            math.log(self.bandwidth_init),
-                                            device=dev))
-            sigma = self.log_sigma.exp()  # (S,)
-        else:
-            sigma = torch.tensor(self.bandwidth_init, device=dev)
-
-        # Combine mask and padding_mask; slice out CLS if present later
-        effective_mask = mask
-        if padding_mask is not None:
-            padding_bt = padding_mask.unsqueeze(1).expand(-1, T, -1)  # [B,T,S or S+1]
-            effective_mask = mask & padding_bt                         # bool
-
-        # Project tokens
-        lat_proj = self.lat_proj(z)  # (B, T, S or S+1, d_model)
-
-        if self.retain_cls:
-            assert lat_proj.size(2) == S + 1, "retain_cls=True requires z to include CLS at index 0."
-            cls_proj    = lat_proj[:, :, 0, :]      # (B,T,d)
-            sensor_proj = lat_proj[:, :, 1:, :]     # (B,T,S,d)
-            sensor_mask = effective_mask[:, :, 1:]  # (B,T,S)
-        else:
-            sensor_proj = lat_proj                  # (B,T,S,d)
-            sensor_mask = effective_mask            # (B,T,S)
-
-        # Positional tokens for queries
-        coord_tok = self.coord_proj(self.pe(Y))     # (B,P,d)
-        coord_tok = self.coord_norm(coord_tok)      # (B,P,d)
-        coord_tok = coord_tok.unsqueeze(1).expand(B, T, P, d_model).reshape(B*T, P, d_model)  # (B*T,P,d)
-
-        # Distance and importance scaling
-        d = torch.cdist(Y, sensor_coords)  # (B,P,S)
-
-        # Build a [B,S] validity mask for sensors (time-invariant proxy from t=0)
-        sensor_valid_bs = sensor_mask[:, 0, :]  # [B,S] (True if valid at t=0)
-        if padding_mask is not None and padding_mask.dim() == 2:
-            sensor_valid_bs = sensor_valid_bs & padding_mask  # [B,S]
-
-        # Set distances to inf for invalid sensors so they never get into top-k
-        d = d.masked_fill(~sensor_valid_bs.unsqueeze(1), float('inf'))  # [B,P,S]
-        phi   = phi_mean.detach()                                       # [B,S]
-        gamma = self.importance_scale
-        d_scaled = d / (phi[:, None, :] ** gamma + 1e-6)                # [B,P,S]
-
-        # ------------------------------------------------------------
-        # Unified top-k aggregation (K_eff = min(K, number_of_valid_sensors))
-        # If self.top_k is None, K_eff = S (i.e., use all valid sensors)
-        # ------------------------------------------------------------
-        local_S = sensor_proj.size(2)  # == S
-        if self.top_k is None:
-            K_eff = local_S
-        else:
-            K_eff = min(self.top_k, local_S)
-
-        # Top-k over smallest distances; if K_eff==S this is equivalent to "all sensors"
-        # For rows where many sensors are invalid (inf), torch.topk returns the S finite ones first anyway.
-        _, top_idx = torch.topk(d_scaled, K_eff, dim=2, largest=False)  # (B,P,K_eff)
-        d_k = torch.gather(d_scaled, 2, top_idx)                        # (B,P,K_eff)
-
-        # Gather phi and per-sensor sigma (if used) at the same indices
-        phi_exp = phi[:, None, :].expand(-1, P, -1)                     # (B,P,S)
-        phi_k   = torch.gather(phi_exp, 2, top_idx)                     # (B,P,K_eff)
-
-        if self.per_sensor_sigma:
-            sigma_k = sigma[top_idx]                                     # (B,P,K_eff)
-        else:
-            sigma_k = sigma                                              # scalar
-
-        scores = -d_k / sigma_k                                          # (B,P,K_eff)
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        exp    = torch.exp(scores)
-
-        # Validity at selected indices (time-invariant proxy from t=0)
-        valid_k = torch.gather(sensor_valid_bs.unsqueeze(1).expand(-1, P, -1), 2, top_idx)  # (B,P,K_eff), bool
-        exp = exp * valid_k.float()
-
-        weights = exp / (exp.sum(dim=-1, keepdim=True) + 1e-6)           # (B,P,K_eff)
-
-        if self.CalRecVar:
-            h, stats = self._topk_aggregate(sensor_proj, top_idx, weights,
-                                            True, d_k, phi_k, valid_k, local_S)
-        else:
-            h = self._topk_aggregate(sensor_proj, top_idx, weights,
-                                    False, d_k, phi_k, valid_k, local_S)
-            stats = None
-
-        h = self.agg_norm(h)              # (B,T,P,d)
-        lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
-
-        # shared_attn shortcut to out_proj(v_proj(lat))
-        if hasattr(self.cross_attn, 'to_v'):
-            v_proj  = self.cross_attn.to_v
-            out_proj = self.cross_attn.out
-        else:
-            mha = self.cross_attn.attn
-            dim = mha.embed_dim
-            v_weight = mha.in_proj_weight[2 * dim : 3 * dim]
-            v_bias   = mha.in_proj_bias[2 * dim : 3 * dim] if mha.in_proj_bias is not None else None
-            def v_proj(x): return F.linear(x, v_weight, v_bias)
-            out_proj = mha.out_proj
-
-        local_lat = out_proj(v_proj(lat))  # [B*T,P,d]
-        local_pre = coord_tok + local_lat
-        local_x = self.norm(local_pre)
-
-        local_out_mean = None
-        if self.retain_cls:
-            cls_proj_bt = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
-            # Residual add with CLS 
-            # fused_pre = local_pre + cls_proj_bt
-            fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
-            fused_pre = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
-
-            fused_x = self.norm(fused_pre)
-            fused_x = fused_x + self.mlp(fused_x)
-            out_mean = self.head(fused_x).view(B, T, P, C)
-            x_for_var = fused_x
-        else:
-            local_x = local_x + self.mlp(local_x)
-            local_out_mean = self.head(local_x).view(B, T, P, C)
-            out_mean = local_out_mean
-            x_for_var = local_x
-
-        # Optional variance head
-        out_logvar = None
-        if self.CalRecVar:
-            stats_emb = self.stats_proj(stats)                     
-            stats_emb = stats_emb.unsqueeze(1).expand(-1, T, -1, -1).reshape(B*T, P, -1)
-            x_var = torch.cat([x_for_var, stats_emb], dim=-1)      
-            logvar = self.var_head(x_var)
-            out_logvar = logvar.view(B, T, P, C)
-
-        return local_out_mean, out_mean, out_logvar
 
 #   Revised 0921: Weighted Fusion in Aggregation
 class SoftDomainAdaptiveReconstructor(nn.Module):
@@ -3331,7 +3124,6 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         phi   = phi_mean.detach()                                       # [B,S]
         gamma = self.importance_scale
         d_scaled = d / (phi[:, None, :] ** gamma + 1e-6)                # [B,P,S]
-        # d_scaled = d 
 
         # ------------------------------------------------------------
         # Unified top-k aggregation (K_eff = min(K, number_of_valid_sensors))
@@ -3385,12 +3177,6 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
         # ------------------------------------------------------------------------------
 
-        # if self.use_checkpoint:
-        #     local_lat = checkpoint(self.cross_attn, coord_tok, lat, lat,
-        #                            use_reentrant=False, preserve_rng_state=False)
-        # else:
-        #     local_lat = self.cross_attn(coord_tok, lat, lat)
-
         if hasattr(self.cross_attn, 'to_v'):
             v_proj  = self.cross_attn.to_v
             out_proj = self.cross_attn.out
@@ -3404,7 +3190,6 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         
         local_lat = out_proj(v_proj(lat))  # [B*T,P,d]
         local_pre = coord_tok + local_lat
-        local_x = self.norm(local_pre)
 
         local_out_mean = None
         if self.retain_cls:
@@ -3417,6 +3202,7 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             out_mean = self.head(fused_x).view(B, T, P, C)
             x_for_var = fused_x
         else:
+            local_x = self.norm(local_pre)
             local_x = local_x + self.mlp(local_x)
             local_out_mean = self.head(local_x).view(B, T, P, C)
             out_mean = local_out_mean
@@ -3432,6 +3218,207 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             out_logvar = logvar.view(B, T, P, C)
 
         return local_out_mean, out_mean, out_logvar
+
+    # Revised 0926: sensor reconstruction from sensor tokens (exclude CLS)
+    def _forward(self,
+                z: torch.Tensor,                # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
+                Y: torch.Tensor,                # [B, P, 2/3]
+                sensor_coords: torch.Tensor,    # [B, S, 2/3]
+                mask: torch.Tensor,             # [B, T, S] (if retain_cls=True, this is for S+1; we slice below)
+                phi_mean: torch.Tensor | None = None,
+
+                padding_mask: torch.Tensor | None = None
+                ):
+        """
+        Returns:
+            global_out_mean: [B, T, S, C] if retain_cls=True else None
+            out_mean:        [B, T, P, C]
+            out_logvar:      [B, T, P, C] or None
+        """
+        B, T, S_or_Sp1, D_raw = z.shape
+        P              = Y.size(1)
+        C              = self.N_channels
+        dev            = z.device
+        d_model        = self.lat_proj.out_features
+
+        S = sensor_coords.size(1)  # true number of sensors (excludes CLS)
+
+        if phi_mean is None: 
+            phi_mean = torch.ones(B, S, device=dev)  # [B,S]
+
+        if self.per_sensor_sigma:
+            if (self.log_sigma is None) or (self.log_sigma.numel() != S):
+                self.log_sigma = nn.Parameter(torch.full((S,),
+                                            math.log(self.bandwidth_init),
+                                            device=dev))
+            sigma = self.log_sigma.exp()  # (S,)
+        else:
+            sigma = torch.tensor(self.bandwidth_init, device=dev)
+
+        # Combine mask and padding_mask; slice out CLS if present later
+        effective_mask = mask
+        if padding_mask is not None:
+            padding_bt = padding_mask.unsqueeze(1).expand(-1, T, -1)  # [B,T,S or S+1]
+            effective_mask = mask & padding_bt
+
+        # Project tokens
+        lat_proj = self.lat_proj(z)  # (B, T, S or S+1, d_model)
+
+        if self.retain_cls:
+            assert lat_proj.size(2) == S + 1, "retain_cls=True requires z to include CLS at index 0."
+            cls_proj    = lat_proj[:, :, 0, :]      # (B,T,d)
+            sensor_proj = lat_proj[:, :, 1:, :]     # (B,T,S,d)
+            sensor_mask = effective_mask[:, :, 1:]  # (B,T,S)
+        else:
+            sensor_proj = lat_proj                  # (B,T,S,d)
+            sensor_mask = effective_mask            # (B,T,S)
+
+        # Positional tokens for queries (Y)
+        coord_tok = self.coord_proj(self.pe(Y))     # (B,P,d)
+        coord_tok = self.coord_norm(coord_tok)      # (B,P,d)
+        coord_tok = coord_tok.unsqueeze(1).expand(B, T, P, d_model).reshape(B*T, P, d_model)  # (B*T,P,d)
+
+        # Distance and importance scaling for Y aggregation
+        d = torch.cdist(Y, sensor_coords)  # (B,P,S)
+
+        # Build a [B,S] validity mask for sensors (time-invariant proxy from t=0)
+        sensor_valid_bs = sensor_mask[:, 0, :]  # [B,S] (True if valid at t=0)
+        if padding_mask is not None and padding_mask.dim() == 2:
+            sensor_valid_bs = sensor_valid_bs & padding_mask  # [B,S]
+
+        # Set distances to inf for invalid sensors so they never get into top-k
+        d = d.masked_fill(~sensor_valid_bs.unsqueeze(1), float('inf'))  # [B,P,S]
+        phi   = phi_mean.detach()                                       # [B,S]
+        gamma = self.importance_scale
+        d_scaled = d / (phi[:, None, :] ** gamma + 1e-6)                # [B,P,S]
+
+        # ------------------------------------------------------------
+        # Unified top-k aggregation (K_eff = min(K, number_of_valid_sensors))
+        # If self.top_k is None, K_eff = S (i.e., use all valid sensors)
+        # ------------------------------------------------------------
+        local_S = sensor_proj.size(2)  # == S
+        if self.top_k is None:
+            K_eff = local_S
+        else:
+            K_eff = min(self.top_k, local_S)
+
+        # Top-k over smallest distances
+        _, top_idx = torch.topk(d_scaled, K_eff, dim=2, largest=False)  # (B,P,K_eff)
+        d_k = torch.gather(d_scaled, 2, top_idx)                        # (B,P,K_eff)
+
+        # Gather phi and per-sensor sigma (if used) at the same indices
+        phi_expan = phi[:, None, :].expand(-1, P, -1)                   # (B,P,S)
+        phi_k     = torch.gather(phi_expan, 2, top_idx)                 # (B,P,K_eff)
+
+        if self.per_sensor_sigma:
+            sigma_k = sigma[top_idx]                                    # (B,P,K_eff)
+        else:
+            sigma_k = sigma                                            # scalar
+
+        scores = -d_k / sigma_k                                         # (B,P,K_eff)
+        scores -= scores.max(dim=-1, keepdim=True).values
+        exp    = torch.exp(scores)
+
+        # Validity at selected indices (time-invariant proxy from t=0)
+        valid_k = torch.gather(sensor_valid_bs.unsqueeze(1).expand(-1, P, -1), 2, top_idx)  # (B,P,K_eff), bool
+        exp = exp * valid_k.float()
+
+        weights = exp / (exp.sum(dim=-1, keepdim=True) + 1e-6)          # (B,P,K_eff)
+
+        # --- Phi-weighted fusion (optional) ---
+        if self.use_weighted_fusion:
+            weights.mul_(phi_k * self.phi_scale)
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+
+        # Aggregate sensor latents for Y
+        if self.CalRecVar:
+            h, stats = self._topk_aggregate(sensor_proj, top_idx, weights,
+                                            True, d_k, phi_k, valid_k, local_S)
+        else:
+            h = self._topk_aggregate(sensor_proj, top_idx, weights,
+                                     False, d_k, phi_k, valid_k, local_S)
+            stats = None
+
+        h = self.agg_norm(h)              # (B,T,P,d)
+        lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
+
+        # Lightweight "V" -> "out" path from cross-attn module
+        if hasattr(self.cross_attn, 'to_v'):
+            v_proj  = self.cross_attn.to_v
+            out_proj = self.cross_attn.out
+        else:
+            mha = self.cross_attn.attn
+            dim = mha.embed_dim
+            v_weight = mha.in_proj_weight[2 * dim : 3 * dim]
+            v_bias   = mha.in_proj_bias[2 * dim : 3 * dim] if mha.in_proj_bias is not None else None
+            def v_proj(x): return F.linear(x, v_weight, v_bias)
+            out_proj = mha.out_proj
+
+        # Y-field reconstruction
+        local_lat = out_proj(v_proj(lat))  # [B*T,P,d]
+        local_pre = coord_tok + local_lat
+
+        if self.retain_cls:
+            # Compute CLS projection once (on [B*T, 1, d]) and expand afterward
+            cls_proj_bt = cls_proj.reshape(B*T, 1, d_model)  # [B*T, 1, d]
+            cls_lat_single = out_proj(v_proj(cls_proj_bt))    # [B*T, 1, d] - compute once
+            cls_lat = cls_lat_single.expand(-1, P, -1)        # [B*T, P, d] - expand result
+            # cls_lat = self.norm(cls_lat)
+
+            fused_pre = local_pre + cls_lat
+            fused_x = self.norm(fused_pre)
+            fused_x = fused_x + self.mlp(fused_x)
+            out_mean = self.head(fused_x).view(B, T, P, C)
+            x_for_var = fused_x
+        else:
+            local_x = self.norm(local_pre)
+            local_x = local_x + self.mlp(local_x)
+            out_mean = self.head(local_x).view(B, T, P, C)
+            x_for_var = local_x
+
+        # ------------------------------------------------------------
+        # Sensor reconstruction from sensor tokens (exclude CLS)
+        # Use the same v->out path and same head for consistency
+        # ------------------------------------------------------------
+        # Coordinate tokens for sensors
+        coord_tok_s = self.coord_proj(self.pe(sensor_coords))               # (B,S,d)
+        coord_tok_s = self.coord_norm(coord_tok_s)                          # (B,S,d)
+        coord_tok_s_bt = coord_tok_s.unsqueeze(1).expand(B, T, S, d_model)\
+                                    .reshape(B*T, S, d_model)               # (B*T,S,d)
+
+        # Project sensor tokens through v->out
+        sensor_bt = sensor_proj.reshape(B*T, S, d_model)                    # (B*T,S,d)
+        sensor_lat_bt = out_proj(v_proj(sensor_bt))                         # (B*T,S,d)
+
+        # Fuse with coordinates and predict
+        global_pre_bt = coord_tok_s_bt + sensor_lat_bt                      # (B*T,S,d)
+
+        if self.retain_cls:
+            # Fuse CLS into sensor reconstruction
+            cls_lat_s = cls_lat_single.expand(-1, S, -1)                    # [B*T, S, d] - expand the same projected CLS to S
+            # cls_lat_s = self.norm(cls_lat_s)
+            global_pre_bt = global_pre_bt + cls_lat_s                       # Add CLS to the sensor pre features
+
+        global_x_bt = self.norm(global_pre_bt)
+        global_x_bt = global_x_bt + self.mlp(global_x_bt)
+        global_out_mean = self.head(global_x_bt).view(B, T, S, C)           # (B,T,S,C)
+
+        # Optionally zero-out invalid sensor positions
+        if sensor_mask is not None:
+            global_out_mean = global_out_mean.masked_fill(
+                (~sensor_mask).unsqueeze(-1), 0.0
+            )
+
+        # Optional variance head on Y
+        out_logvar = None
+        if self.CalRecVar:
+            stats_emb = self.stats_proj(stats)                     
+            stats_emb = stats_emb.unsqueeze(1).expand(-1, T, -1, -1).reshape(B*T, P, -1)
+            x_var = torch.cat([x_for_var, stats_emb], dim=-1)      
+            logvar = self.var_head(x_var)
+            out_logvar = logvar.view(B, T, P, C)
+
+        return global_out_mean, out_mean, out_logvar
 
 # ==============================
 # Complete Model wrappers
@@ -3686,6 +3673,112 @@ class TD_ROM_Bay_DD(nn.Module):
         if self.Supervise_Sensors:  # Only decode the values at the sensors's locations
             G_u_cls_sens, G_u_mean_Sens, G_u_logvar_Sens = self.decoder(latent_traj, sensor_coords_from_encoder, sensor_coords=sensor_coords_from_encoder, 
                     mask=mask_from_encoder[:, -1:] if mask_from_encoder.dim() > 1 else mask_from_encoder, phi_mean=phi_mean)
+
+        return (G_u_mean, G_u_logvar, 
+                G_obs, latent_traj, latent_traj_logvar, 
+                G_u_cls, 
+                G_u_mean_Sens, G_u_logvar_Sens)
+
+    #  Revised 0926, reconstructor will rebuild sensor values
+    def _forward(self,
+                G_down: torch.Tensor,     # [B, N_ts, N_xs, F]  (down-sampled)
+                G_full: torch.Tensor,     # [B, T_full, N_pts, 1]
+                Y     : torch.Tensor,     # [N_pts, N_dim] 
+                U     : torch.Tensor,     # [B, N-para] (can be dummy tensor)
+                teacher_force_prob: float,
+                ):    
+
+        # --- Extract number of required integration steps ---
+        
+        B, T_full, N_pts, _ = G_full.shape
+        _, N_ts, N_xs, F_feat = G_down.shape
+
+        # Compute original phi on retained sensors if adaptive
+        original_phi = None
+        if self.use_adaptive_selection:
+            current_coords = G_down[:, 0, :, :2]  # [B, K, 2] (per-batch, t=0; shared across t for each case in a batch)
+            assert current_coords.shape == (B, N_xs, 2), f"Coords shape mismatch: {current_coords.shape}"
+
+            log_ab_1 = self.phi_mlp_1(current_coords)                         
+            alpha_1  = torch.exp(log_ab_1[:, :, 0]) + 1e-3                     
+            beta_1   = torch.exp(log_ab_1[:, :, 1]) + 1e-3
+            if self.training: phi_1 = torch.distributions.Beta(alpha_1, beta_1).rsample()
+            else:
+                # Compute mean phi (Beta expectation) instead of sampling
+                mean_phi_1 = torch.clamp(alpha_1 / (alpha_1 + beta_1) , min=1e-3, max=1-1e-3)  # Clamp for stability
+                phi_1 = mean_phi_1
+
+            # Temporal contributions by phi_mlp_2:
+            if self.stage == 1 and self.cfg["bayesian_phi"]["update_in_stage1"] == True:
+                log_ab_2 = self.phi_mlp_2(current_coords)                        
+                alpha_2  = torch.exp(log_ab_2[:, :, 0]) + 1e-3                     
+                beta_2   = torch.exp(log_ab_2[:, :, 1]) + 1e-3
+                if self.training: phi_2 = torch.distributions.Beta(alpha_2, beta_2).rsample()
+                else:
+                    mean_phi_2 = torch.clamp(alpha_2 / (alpha_2 + beta_2), min=1e-3, max=1-1e-3)
+                    phi_2 = mean_phi_2
+            else:
+                phi_2 = torch.ones_like(phi_1) # No temporal uncertainty considered
+
+            original_phi = phi_1 * phi_2
+
+        # --- Transformer encoder -> latent tokens of ALL observed frames ---
+        G_obs, mask_from_encoder, sensor_coords_from_encoder, merged_phi = self.fieldencoder(G_down, U, original_phi) 
+        is_multi_token = (G_obs.dim() == 4)
+
+        if is_multi_token:
+            B, Tobs, L, D = G_obs.shape
+            if self.cfg.get('decoder_type', "CausalTrans") != "UD_Trans":
+                latent_seed = G_obs.permute(0, 2, 1, 3).contiguous().view(B * L, Tobs, D)
+            else:
+                latent_seed = G_obs 
+
+        if self.stage == 0 or self.N_window == T_full: 
+            latent_traj = G_obs
+            latent_traj_logvar = None
+        else:
+            # --- Integrate the latent dynamics ---------------------------------
+
+            imp = original_phi.detach() if self.Use_imp_in_dyn is True else None
+
+            if self.training:
+                output = self.TemporalDecoderAdapter.forward_autoreg(
+                    G_latent           = latent_seed,
+                    N_Fore             = T_full,
+                    imp                = imp,
+                    N_window           = self.N_window,
+                    teacher_force_seq  = None,      # ground truth tokens
+                    teacher_force_prob = teacher_force_prob,
+                    truncate_k         = 64,               
+                )
+            else: # evaluation / inference
+                output = self.TemporalDecoderAdapter(
+                    G_latent = latent_seed,
+                    N_Fore   = T_full,
+                    N_window = self.N_window,
+                    imp      = imp,
+                    )
+            latent_traj, latent_traj_logvar = output
+
+        if is_multi_token and self.cfg.get('decoder_type', "CausalTrans") != "UD_Trans":
+            latent_traj = latent_traj.view(B, L, T_full, D).permute(0, 2, 1, 3)  # (B, T_full, L, D)
+            if latent_traj_logvar is not None:
+                    latent_traj_logvar = latent_traj_logvar.view(B, L, T_full, D).permute(0, 2, 1, 3)
+
+        # --- Decode back to physical space ---------------------------------
+        phi_mean = merged_phi if self.use_adaptive_selection else None
+        self.phi_mean_ = phi_mean
+        self.sensor_coords_ = sensor_coords_from_encoder
+
+        G_u_mean_Sens = G_u_logvar_Sens = None
+        G_u_mean = G_u_logvar = None
+
+        G_u_cls, G_u_mean, G_u_logvar = self.decoder(latent_traj, Y, sensor_coords=sensor_coords_from_encoder, 
+                mask=mask_from_encoder[:, -1:] if mask_from_encoder.dim() > 1 else mask_from_encoder, phi_mean=phi_mean) 
+        # G_u_cls is the sensor's values rebuilt on CLS
+        
+        if self.Supervise_Sensors:  # Only decode the values at the sensors's locations
+            G_u_mean_Sens = G_u_cls
 
         return (G_u_mean, G_u_logvar, 
                 G_obs, latent_traj, latent_traj_logvar, 

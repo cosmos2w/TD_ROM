@@ -150,7 +150,8 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     Use_Adaptive_Selection = cfg.get("Use_Adaptive_Selection", False)
     domain_decompose       = cfg.get('domain_decompose', False)
     CalRecVar              = cfg.get("CalRecVar", False)
-    retain_cls             = cfg.get("retain_cls", False)     
+    retain_cls             = cfg.get("retain_cls", False)
+    Use_imp_in_dyn         = cfg.get("Use_imp_in_dyn", False)
 
     if domain_decompose and cfg['pooling'] == 'none':
         encoder = DomainAdaptiveEncoder(
@@ -200,20 +201,13 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             dt      = cfg["delta_t"],
         )
     elif cfg["decoder_type"] == "UD_Trans": # UD = uncertainty-driven
-        # decoder_lat = UncertaintyAwareTemporalDecoder(
-        #     d_model = cfg["F_dim"],
-        #     n_layers= cfg["num_layers_propagator"],
-        #     n_heads = cfg["num_heads"],
-        #     dt      = cfg["delta_t"],
-        #     unc_token_dim=cfg.get("unc_token_dim", 16),
-        #     gamma=cfg.get("gamma", 1.0)
-        # )
         decoder_lat = TemporalDecoderHierarchical(
             d_model = cfg["F_dim"],
             n_layers= cfg["num_layers_propagator"],
             n_heads = cfg["num_heads"],
             dt      = cfg["delta_t"],
         )
+        print(f'Building up the TemporalDecoderHierarchical for dynamic forecasting ! ')
 
     if domain_decompose and cfg['pooling'] == 'none':
         field_dec = SoftDomainAdaptiveReconstructor(
@@ -240,7 +234,8 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     if cfg["Use_Adaptive_Selection"] == True:
         net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec,
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"],
-                    use_adaptive_selection=Use_Adaptive_Selection, CalRecVar = CalRecVar, retain_cls = retain_cls)
+                    use_adaptive_selection = Use_Adaptive_Selection, CalRecVar = CalRecVar, 
+                    retain_cls = retain_cls, Use_imp_in_dyn = Use_imp_in_dyn)
     else:
         net = TD_ROM(encoder, decoder_lat, field_dec, 
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"])  
@@ -701,33 +696,33 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        default="collinear_flow_Re100",
+        default="collinear_flow_Re40",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=1, 
+    parser.add_argument('--indice', type=int, default=4, 
                         help='net checkpoint index: which net')
-    parser.add_argument('--stage', type=int, default=1, 
+    parser.add_argument('--stage', type=int, default=0, 
                         help='net checkpoint index: which stage')
     parser.add_argument('--Repeat_id', type=int, default=0, 
                         help='Different propagator id sharing the same encoder and decoder')
     
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
-    parser.add_argument("--T_ini", type=int, default=8000,
+    parser.add_argument("--T_ini", type=int, default=1000,
                         help="Initial time index from which to start prediction")
-    parser.add_argument("--N_pred", type=int, default=48,
+    parser.add_argument("--N_pred", type=int, default=1,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=96,
+    parser.add_argument("--num_space_sample", type=int, default=16,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,
                         help="Decide whether we select best sensors based on retain probability")
-    parser.add_argument("--Retain_Num", type=int, default=32,
+    parser.add_argument("--Retain_Num", type=int, default=8,
                         help="Decide the number of topK important sensors")
     
-    parser.add_argument("--SAVE_GIF", action='store_true', default=True,
+    parser.add_argument("--SAVE_GIF", action='store_true', default=False,
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")

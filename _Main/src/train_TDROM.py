@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="channel_flow",
+        default="collinear_flow_Re40",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -493,7 +493,7 @@ def train(cfg: dict):
             nll_loss = 0.0
             if CalRecVar and stage == 0:
                 var = torch.exp(out_logvar) + 1e-6  # [B, T, P, C] variance (positive)
-                var_sen = (torch.exp(G_u_logvar_Sens) + 1e-6).mean() if Supervise_Sensors==True else 0
+                var_sen = (torch.exp(G_u_logvar_Sens) + 1e-6).mean() if Supervise_Sensors==True and G_u_logvar_Sens != None else 0
 
                 nll_main = 0.5 * (( (out - G_f)**2 / var ) + out_logvar).mean() + var_sen  # Mean over all dims
                 nll_loss = nll_weight * (nll_main)
@@ -574,19 +574,20 @@ def train(cfg: dict):
             else:
                 loss_mse  = mse(out, G_f)
 
-            if retain_cls is True and G_u_cls is not None:
-                if N_c > 1:
-                    loss_mse_channels_cls = []
-                    for ci in range(N_c):
-                        if stage == 2:
-                            loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-                        else:
-                            loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-                        loss_mse_channels_cls.append(loss_channel)
-                    loss_U  = w_cls * sum(loss_mse_channels_cls)
-                else:
-                    loss_U  = w_cls * mse(G_u_cls, G_f)
-            else: loss_U = 0.0
+            # if retain_cls is True and G_u_cls is not None:
+            #     if N_c > 1:
+            #         loss_mse_channels_cls = []
+            #         for ci in range(N_c):
+            #             if stage == 2:
+            #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
+            #             else:
+            #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
+            #             loss_mse_channels_cls.append(loss_channel)
+            #         loss_U  = w_cls * sum(loss_mse_channels_cls)
+            #     else:
+            #         loss_U  = w_cls * mse(G_u_cls, G_f)
+            # else: loss_U = 0.0
+            loss_U = 0.0
 
             if stage == 0 and Supervise_Sensors:
                 loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
@@ -678,7 +679,7 @@ def train(cfg: dict):
 
                     if stage == 0:
                         var = torch.exp(out_logvar) + 1e-6
-                        var_sen = (torch.exp(G_u_logvar_Sens) + 1e-6).mean() if Supervise_Sensors==True else 0.0
+                        var_sen = (torch.exp(G_u_logvar_Sens) + 1e-6).mean() if Supervise_Sensors==True and G_u_logvar_Sens != None else 0
                         nll_main = 0.5 * (( (out - G_f)**2 / var ) + out_logvar).mean() + var_sen
                         nll_loss = nll_weight * nll_main  # Unweighted for test logging
 
@@ -688,19 +689,20 @@ def train(cfg: dict):
                 else:
                     loss_mse  = mse(out, G_f)
 
-                if retain_cls is True and G_u_cls is not None:
-                    if N_c > 1:
-                        loss_mse_channels_cls = []
-                        for ci in range(N_c):
-                            if stage == 2:
-                                loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-                            else:
-                                loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-                            loss_mse_channels_cls.append(loss_channel)
-                        loss_U  = w_cls * sum(loss_mse_channels_cls)
-                    else:
-                        loss_U  = w_cls * mse(G_u_cls, G_f)
-                else: loss_U = 0.0
+                # if retain_cls is True and G_u_cls is not None:
+                #     if N_c > 1:
+                #         loss_mse_channels_cls = []
+                #         for ci in range(N_c):
+                #             if stage == 2:
+                #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
+                #             else:
+                #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
+                #             loss_mse_channels_cls.append(loss_channel)
+                #         loss_U  = w_cls * sum(loss_mse_channels_cls)
+                #     else:
+                #         loss_U  = w_cls * mse(G_u_cls, G_f)
+                # else: loss_U = 0.0
+                loss_U = 0.0
 
                 if stage == 0 and Supervise_Sensors:
                     loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
