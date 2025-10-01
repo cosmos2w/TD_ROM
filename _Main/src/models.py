@@ -432,10 +432,10 @@ class DomainAdaptiveEncoder(nn.Module):
         tok_flat = tok.reshape(B * T, N_inp, -1)                               # (B*T,N,D)
 
         # ------------------------------------------------------------------ 
+        lat = self.latents['latent_param'].expand(B * T, -1, -1)               # (B*T,L,D)
         # Prepare latent + CLS tokens
         if self.retain_cls:
             cls = self.latents['cls_token'].expand(B * T, 1, -1)                   # (B*T,1,D)
-            lat = self.latents['latent_param'].expand(B * T, -1, -1)               # (B*T,L,D)
             lat = torch.cat([cls, lat], dim=1)                                     # (B*T,1+L,D)
 
         # Cross-attention: sensor tokens -> latent tokens
@@ -3007,6 +3007,7 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         print(f'self.retain_cls is {self.retain_cls}')
         if self.retain_cls: 
             self.fusion_proj = nn.Linear(2 * d_model, d_model)  # Projects concatenated [local + CLS] back to d_model
+            self.cls_gain = nn.Parameter(torch.zeros(d_model))
 
         if CalRecVar:
             self.stats_dim = 4  # mean_d, std_d, effective_K, mean_phi
@@ -3189,20 +3190,29 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             out_proj = mha.out_proj
         
         local_lat = out_proj(v_proj(lat))  # [B*T,P,d]
-        local_pre = coord_tok + local_lat
 
         local_out_mean = None
         if self.retain_cls:
-            cls_proj_bt = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
-            fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
-            fused_pre = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
+            cls_proj_bt  = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
+
+            # local_pre    = coord_tok + local_lat
+            # fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
+            # fused_pre    = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
+
+            # fused_concat = torch.cat([local_lat, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
+            # fused_lat    = self.fusion_proj(fused_concat)
+            # fused_pre    = coord_tok + fused_lat
+
+            fused_pre    = coord_tok + local_lat + cls_proj_bt * self.cls_gain  # (B*T, P, d_model) - gated addition
 
             fused_x = self.norm(fused_pre)
             fused_x = fused_x + self.mlp(fused_x)
             out_mean = self.head(fused_x).view(B, T, P, C)
             x_for_var = fused_x
         else:
+            local_pre = coord_tok + local_lat
             local_x = self.norm(local_pre)
+            
             local_x = local_x + self.mlp(local_x)
             local_out_mean = self.head(local_x).view(B, T, P, C)
             out_mean = local_out_mean
@@ -3219,7 +3229,7 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
 
         return local_out_mean, out_mean, out_logvar
 
-    # Revised 0926: sensor reconstruction from sensor tokens (exclude CLS)
+    # Revised 0926: sensor reconstruction from sensor tokens
     def _forward(self,
                 z: torch.Tensor,                # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
                 Y: torch.Tensor,                # [B, P, 2/3]
@@ -3361,11 +3371,15 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         if self.retain_cls:
             # Compute CLS projection once (on [B*T, 1, d]) and expand afterward
             cls_proj_bt = cls_proj.reshape(B*T, 1, d_model)  # [B*T, 1, d]
+            
             cls_lat_single = out_proj(v_proj(cls_proj_bt))    # [B*T, 1, d] - compute once
             cls_lat = cls_lat_single.expand(-1, P, -1)        # [B*T, P, d] - expand result
-            # cls_lat = self.norm(cls_lat)
-
             fused_pre = local_pre + cls_lat
+
+            # fused_concat = torch.cat([local_lat, cls_lat], dim=-1)  # (B*T, P, 2*d_model)
+            # fused_lat    = self.fusion_proj(fused_concat)
+            # fused_pre    = coord_tok + fused_lat
+
             fused_x = self.norm(fused_pre)
             fused_x = fused_x + self.mlp(fused_x)
             out_mean = self.head(fused_x).view(B, T, P, C)
@@ -3775,7 +3789,6 @@ class TD_ROM_Bay_DD(nn.Module):
 
         G_u_cls, G_u_mean, G_u_logvar = self.decoder(latent_traj, Y, sensor_coords=sensor_coords_from_encoder, 
                 mask=mask_from_encoder[:, -1:] if mask_from_encoder.dim() > 1 else mask_from_encoder, phi_mean=phi_mean) 
-        # G_u_cls is the sensor's values rebuilt on CLS
         
         if self.Supervise_Sensors:  # Only decode the values at the sensors's locations
             G_u_mean_Sens = G_u_cls

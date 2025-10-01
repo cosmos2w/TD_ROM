@@ -696,7 +696,7 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        default="collinear_flow_Re40",
+        default="collinear_flow_Re100",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -710,11 +710,11 @@ def main():
     
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
-    parser.add_argument("--T_ini", type=int, default=1000,
+    parser.add_argument("--T_ini", type=int, default=29000,
                         help="Initial time index from which to start prediction")
     parser.add_argument("--N_pred", type=int, default=1,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=16,
+    parser.add_argument("--num_space_sample", type=int, default=32,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,
@@ -726,7 +726,7 @@ def main():
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for reproducibility")
     parser.add_argument("--plot_ids", type=int, nargs="*", default=None,
                    help="indices within the prediction window to plot "

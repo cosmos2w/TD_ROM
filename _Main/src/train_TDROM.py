@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="collinear_flow_Re40",
+        default="collinear_flow_Re100",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -944,11 +944,12 @@ def train(cfg: dict):
                     plt.close()
 
             # early-stopping & checkpoint
-            # if avg_test_loss_mse < best_test: 
-            #     best_test, epochs_no_imp = avg_test_loss_mse, 0
+
+            if avg_test_loss_mse < best_test: 
+                best_test, epochs_no_imp = avg_test_loss_mse, 0
             
-            if avg_train_loss_mse < best_test:
-                best_test, epochs_no_imp = avg_train_loss_mse, 0
+            # if avg_train_loss_mse < best_test:
+            #     best_test, epochs_no_imp = avg_train_loss_mse, 0
 
                 ckpt_dir = pathlib.Path(cfg["save_net_dir"]); ckpt_dir.mkdir(exist_ok=True, parents=True)
                 state_dict = (model.module if isinstance(model, nn.DataParallel) else model).state_dict()
