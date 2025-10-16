@@ -79,7 +79,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     retain_cls             = cfg.get("retain_cls", False)
     Use_imp_in_dyn         = cfg.get("Use_imp_in_dyn", False)
 
-    if domain_decompose and cfg['pooling'] == 'none':
+    if domain_decompose:
         encoder = DomainAdaptiveEncoder(
             All_dim         = cfg["F_dim"],
             num_heads       = cfg["num_heads"],
@@ -135,7 +135,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
         )
         print(f'Building up the TemporalDecoderHierarchical for dynamic forecasting ! ')
 
-    if domain_decompose and cfg['pooling'] == 'none':
+    if domain_decompose:
         field_dec = SoftDomainAdaptiveReconstructor(
             d_model=cfg["F_dim"],
             num_heads=cfg["num_heads"],
@@ -157,14 +157,16 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             )
         print(f'\nBuilding Perceiver-style decoder as the field reconstructor!\n')
 
-    if cfg["Use_Adaptive_Selection"] == True:
+    if domain_decompose:
         net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec,
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"],
                     use_adaptive_selection = Use_Adaptive_Selection, CalRecVar = CalRecVar, 
                     retain_cls = retain_cls, Use_imp_in_dyn = Use_imp_in_dyn)
+        print(f'\nBuilding TD_ROM_Bay_DD as the model wrapper!\n')
     else:
         net = TD_ROM(encoder, decoder_lat, field_dec, 
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"])  
+        print(f'\nBuilding plain TD_ROM as the model wrapper!\n')
 
     return net, Net_Name
 
@@ -353,14 +355,14 @@ def train(cfg: dict):
     # 2) model / opt ------------------------------------------
     Use_Adaptive_Selection = cfg.get("Use_Adaptive_Selection", False)  # Default to False if not in YAML
     CalRecVar              = cfg.get("CalRecVar", False)  if Use_Adaptive_Selection else False
-    retain_cls             = cfg.get("retain_cls", False) if Use_Adaptive_Selection else False
-    Supervise_Sensors      = cfg.get("Supervise_Sensors", False)  if Use_Adaptive_Selection else False
+
+    retain_cls             = cfg.get("retain_cls", False) # if Use_Adaptive_Selection else False
+    Supervise_Sensors      = cfg.get("Supervise_Sensors", False)  # if Use_Adaptive_Selection else False
 
     model, Net_Name = build_model(cfg, N_c)
 
     stage = cfg["Stage"]  
     Reload_Trained = cfg.get("Reload_Trained", False)
-
     if stage >= 1 or Reload_Trained is True:  
         load_Net_Name = f"TD_ROM_id{cfg['case_index']}_st0_num0"
         ckpt_path = os.path.join(cfg["save_net_dir"], f"Net_{load_Net_Name}.pth")
@@ -523,12 +525,17 @@ def train(cfg: dict):
                 # ----------------------------------------
                 var_pred = torch.exp(out_logvar).detach() if out_logvar is not None else torch.zeros_like(out)
 
-                # pool over batch/time/channel
+                # Choice (1) pool over batch/time/channel
                 # uncert = var_pred.mean(dim=(0,1,3))            # shape [N_pts]
 
-                # New: Hierarchical (per-batch mean, then max across batches)
-                uncert_batch = var_pred.mean(dim=(1,3))  # Mean over T/C per batch → [B, N_pts]
-                uncert = uncert_batch.max(dim=0)[0]      # Max over batches → [N_pts]
+                # Choice (2) Hierarchical (per-batch mean, then max across batches)
+                # uncert_batch = var_pred.mean(dim=(1,3))  # Mean over T/C per batch → [B, N_pts]
+                # uncert = uncert_batch.max(dim=0)[0]      # Max over batches → [N_pts]
+
+                # Choice (3) per-batch max & mean mixing across batches
+                uncert_max  = torch.amax(var_pred, dim=(0,1,3))      # Max over batches → [N_pts]
+                uncert_mean = var_pred.mean(dim=(0,1,3))             # Mean over batches → [N_pts]
+                uncert = 0.5 * uncert_max # + 0.5 * uncert_mean
 
                 uncert = (uncert - uncert.min()) / (uncert.max() - uncert.min() + 1e-6)  # Normalize
                 uncert = uncert ** 1.5
@@ -590,6 +597,7 @@ def train(cfg: dict):
             loss_U = 0.0
 
             if stage == 0 and Supervise_Sensors:
+                # print(f'G_u_mean_Sens.shape is {G_u_mean_Sens.shape}')
                 loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
             else:  loss_obs = 0.0
             

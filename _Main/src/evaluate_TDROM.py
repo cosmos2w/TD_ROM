@@ -153,7 +153,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     retain_cls             = cfg.get("retain_cls", False)
     Use_imp_in_dyn         = cfg.get("Use_imp_in_dyn", False)
 
-    if domain_decompose and cfg['pooling'] == 'none':
+    if domain_decompose:
         encoder = DomainAdaptiveEncoder(
             All_dim         = cfg["F_dim"],
             num_heads       = cfg["num_heads"],
@@ -209,7 +209,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
         )
         print(f'Building up the TemporalDecoderHierarchical for dynamic forecasting ! ')
 
-    if domain_decompose and cfg['pooling'] == 'none':
+    if domain_decompose:
         field_dec = SoftDomainAdaptiveReconstructor(
             d_model=cfg["F_dim"],
             num_heads=cfg["num_heads"],
@@ -231,17 +231,18 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             )
         print(f'\nBuilding Perceiver-style decoder as the field reconstructor!\n')
 
-    if cfg["Use_Adaptive_Selection"] == True:
+    if domain_decompose:
         net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec,
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"],
                     use_adaptive_selection = Use_Adaptive_Selection, CalRecVar = CalRecVar, 
                     retain_cls = retain_cls, Use_imp_in_dyn = Use_imp_in_dyn)
+        print(f'\nBuilding TD_ROM_Bay_DD as the model wrapper!\n')
     else:
         net = TD_ROM(encoder, decoder_lat, field_dec, 
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"])  
+        print(f'\nBuilding plain TD_ROM as the model wrapper!\n')
 
     return net, Net_Name
-
 
 # --------------------------------------------------------------- 1. Load Data
 
@@ -354,8 +355,6 @@ def build_tensors(u_true_full, xy_norm, region_idx, recon_idx, time_vec,
     # gather helpers ---------------------------------------------------------
     def gather(u, s_idx):          # u: (Nt,Npts,Nc)
         return u[:, s_idx, :]      # -> (Nt,|s_idx|,Nc)
-    # print(f'recon_idx is {recon_idx}')
-    # print(f'u_true_full.shape is {u_true_full.shape}')
 
     G_full_u = gather(u_true_full, recon_idx)
     # G_down_u = gather(u_true_full[:N_window], obs_idx)
@@ -696,12 +695,12 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        default="collinear_flow_Re100",
+        default="turbulent_combustion",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=4, 
+    parser.add_argument('--indice', type=int, default=5, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=0, 
                         help='net checkpoint index: which stage')
@@ -710,11 +709,11 @@ def main():
     
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
-    parser.add_argument("--T_ini", type=int, default=29000,
+    parser.add_argument("--T_ini", type=int, default=3999,
                         help="Initial time index from which to start prediction")
     parser.add_argument("--N_pred", type=int, default=1,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=32,
+    parser.add_argument("--num_space_sample", type=int, default=96,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,

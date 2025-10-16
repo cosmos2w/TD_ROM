@@ -449,7 +449,7 @@ class DomainAdaptiveEncoder(nn.Module):
         tok_flat_up  = tok_flat_up + self.token_to_latent(tok_flat_up, lat, lat)
         tok_flat_out = tok_flat_up + self.token_to_latent_mixer(tok_flat_up)
 
-        # tok_flat_out = tok_flat_up + self.token_to_latent(tok_flat_up, lat, lat)
+        # tok_flat_out = tok_flat_up + self.token_to_latent(tok_flat_up, lat, lat)    # Skip the self-attn-based token_to_latent_mixer
 
         # ------------------------------------------------------------------ 
         # Optionally keep CLS as part of the output token set
@@ -2960,7 +2960,7 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         retain_cls: bool = False,
         use_checkpoint: bool = True,
 
-        # --- New for phi incorporation toggles (set to True for combined use) ---
+        # --- phi incorporation toggles (set to True for combined use) ---
         use_weighted_fusion: bool = True,   # Toggle Weighted Fusion in Aggregation
         phi_scale: float = 0.5,             # Tunable scale for phi modulation (to avoid over-amplification)
     ):
@@ -3176,8 +3176,12 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
 
         h = self.agg_norm(h)              # (B,T,P,d)
         lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
-        # ------------------------------------------------------------------------------
+        # lat - [B*T, P, d] is the result of the top-k aggregation. 
+        # For each of the P query points, lat holds a feature vector 
+        # that is a weighted average of the features from its K nearest sensor locations.
 
+        # this block re-purposes components of a cross-attention layer
+        # to act as a two-layer linear transformation block.
         if hasattr(self.cross_attn, 'to_v'):
             v_proj  = self.cross_attn.to_v
             out_proj = self.cross_attn.out
@@ -3188,22 +3192,23 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             v_bias   = mha.in_proj_bias[2 * dim : 3 * dim] if mha.in_proj_bias is not None else None
             def v_proj(x): return F.linear(x, v_weight, v_bias)
             out_proj = mha.out_proj
-        
-        local_lat = out_proj(v_proj(lat))  # [B*T,P,d]
 
+        local_lat = out_proj(v_proj(lat))
+        # ------------------------------------------------------------------------------
+        
         local_out_mean = None
         if self.retain_cls:
             cls_proj_bt  = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
 
-            # local_pre    = coord_tok + local_lat
-            # fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
-            # fused_pre    = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
+            local_pre    = coord_tok + local_lat
+            fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
+            fused_pre    = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
 
             # fused_concat = torch.cat([local_lat, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
             # fused_lat    = self.fusion_proj(fused_concat)
             # fused_pre    = coord_tok + fused_lat
 
-            fused_pre    = coord_tok + local_lat + cls_proj_bt * self.cls_gain  # (B*T, P, d_model) - gated addition
+            # fused_pre    = coord_tok + local_lat + cls_proj_bt
 
             fused_x = self.norm(fused_pre)
             fused_x = fused_x + self.mlp(fused_x)
@@ -3211,8 +3216,8 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             x_for_var = fused_x
         else:
             local_pre = coord_tok + local_lat
+
             local_x = self.norm(local_pre)
-            
             local_x = local_x + self.mlp(local_x)
             local_out_mean = self.head(local_x).view(B, T, P, C)
             out_mean = local_out_mean
@@ -3610,25 +3615,36 @@ class TD_ROM_Bay_DD(nn.Module):
             log_ab_1 = self.phi_mlp_1(current_coords)                         
             alpha_1  = torch.exp(log_ab_1[:, :, 0]) + 1e-3                     
             beta_1   = torch.exp(log_ab_1[:, :, 1]) + 1e-3
-            if self.training: phi_1 = torch.distributions.Beta(alpha_1, beta_1).rsample()
-            else:
-                # Compute mean phi (Beta expectation) instead of sampling
-                mean_phi_1 = torch.clamp(alpha_1 / (alpha_1 + beta_1) , min=1e-3, max=1-1e-3)  # Clamp for stability
-                phi_1 = mean_phi_1
+
+            # if self.training: phi_1 = torch.distributions.Beta(alpha_1, beta_1).rsample()
+            # else:
+            #     # Compute mean phi (Beta expectation) instead of sampling
+            #     mean_phi_1 = torch.clamp(alpha_1 / (alpha_1 + beta_1) , min=1e-3, max=1-1e-3)  # Clamp for stability
+            #     phi_1 = mean_phi_1
+
+            mean_phi_1 = torch.clamp(alpha_1 / (alpha_1 + beta_1) , min=1e-3, max=1-1e-3)  # Clamp for stability
+            phi_1 = mean_phi_1
 
             # Temporal contributions by phi_mlp_2:
             if self.stage == 1 and self.cfg["bayesian_phi"]["update_in_stage1"] == True:
                 log_ab_2 = self.phi_mlp_2(current_coords)                        
                 alpha_2  = torch.exp(log_ab_2[:, :, 0]) + 1e-3                     
                 beta_2   = torch.exp(log_ab_2[:, :, 1]) + 1e-3
-                if self.training: phi_2 = torch.distributions.Beta(alpha_2, beta_2).rsample()
-                else:
-                    mean_phi_2 = torch.clamp(alpha_2 / (alpha_2 + beta_2), min=1e-3, max=1-1e-3)
-                    phi_2 = mean_phi_2
+
+                # if self.training: phi_2 = torch.distributions.Beta(alpha_2, beta_2).rsample()
+                # else:
+                #     mean_phi_2 = torch.clamp(alpha_2 / (alpha_2 + beta_2), min=1e-3, max=1-1e-3)
+                #     phi_2 = mean_phi_2
+
+                mean_phi_2 = torch.clamp(alpha_2 / (alpha_2 + beta_2), min=1e-3, max=1-1e-3)
+                phi_2 = mean_phi_2
+
             else:
                 phi_2 = torch.ones_like(phi_1) # No temporal uncertainty considered
 
             original_phi = phi_1 * phi_2
+        else: 
+            original_phi = None # no adaptive sensor selection
 
         # --- Transformer encoder -> latent tokens of ALL observed frames ---
         G_obs, mask_from_encoder, sensor_coords_from_encoder, merged_phi = self.fieldencoder(G_down, U, original_phi) 
