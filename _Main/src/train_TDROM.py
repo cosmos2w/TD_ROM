@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="collinear_flow_Re100",
+        default="channel_flow",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -174,32 +174,28 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
 def select_and_gather_batch(G_d,                 # [B, T, N_x, N_call]
                             base_model,
                             epoch: int,
-                            cfg):
+                            cfg,
+                            downsample_ratio: float):
+    """
+    Selects a subset of sensors based on their importance scores (phi) and a dynamic ratio.
 
-    device              = G_d.device
-    B, T, N_x, N_call   = G_d.shape
-    min_r               = cfg["bayesian_phi"]["min_retain"]
-    max_r               = cfg["bayesian_phi"]["max_retain"]      # == K_max
-    Stage               = cfg["Stage"]
+    Directly calculates the number of sensors to keep based on
+    the `downsample_ratio` and uses `torch.topk` to select the most important ones
+    according to their calculated `phi` values.
+    """
+    device            = G_d.device
+    B, T, N_x, N_call = G_d.shape
+    Stage             = cfg["Stage"]
 
     # --------------------------------------------------------
-    # 1) coordinates of all candidates in one tensor
-    #    coords_flat : [B*N_x, 2]
+    # 1) Calculate phi values (importance scores) for all candidate sensors.
+    #    This part of the logic remains the same as it's fundamental to your model.
     # --------------------------------------------------------
     coords_flat = G_d[:, 0, :, :2].reshape(-1, 2).contiguous()
 
-    # --------------------------------------------------------
-    # 2) reproducible RNG: one seed per sample, We create a seed for all B*N_x rows at once.
-    # --------------------------------------------------------
-    sample_ids = torch.arange(B, device=device).repeat_interleave(N_x)
-    seeds_flat = (epoch << 16) + sample_ids              # [B*N_x]
-
     with torch.random.fork_rng(devices=[device]):
-        torch.manual_seed(int(epoch))                    # any global seed
+        torch.manual_seed(int(epoch))
 
-        # ----------------------------------------------------
-        # 2.1) draw the two φ’s in one pass
-        # ----------------------------------------------------
         log_ab1 = base_model.phi_mlp_1(coords_flat)      # [BN_x, 2]
         alpha1  = torch.exp(log_ab1[:, 0]) + 1e-3
         beta1   = torch.exp(log_ab1[:, 1]) + 1e-3
@@ -216,67 +212,27 @@ def select_and_gather_batch(G_d,                 # [B, T, N_x, N_call]
         phi_flat = (phi1 * phi2).view(B, N_x)            # [B, N_x]
 
     # --------------------------------------------------------
-    # 3) threshold mask
+    # 2) SIMPLIFIED SELECTION LOGIC
+    #    Directly select the top sensors based on the downsample_ratio.
     # --------------------------------------------------------
-    if Stage == 0:
-        frac      = min(epoch / cfg["bayesian_phi"]["anneal_epochs"], 1.0)
-        thr       = cfg["bayesian_phi"].get("initial_threshold", 0.05) + 0.60 * frac
-    else:
-        thr       = 0.0
+    # Calculate the number of sensors to keep for this batch.
+    num_to_keep = max(1, int(N_x * downsample_ratio))
 
-    keep_mask  = phi_flat >= thr                         # [B, N_x]
-    k_keep     = keep_mask.sum(dim=1)                    # [B]
+    # Directly select the indices of the top 'num_to_keep' sensors based on their phi values.
+    _, top_indices = phi_flat.topk(k=num_to_keep, dim=1)
 
     # --------------------------------------------------------
-    # 4) pre-compute the two “top-k” tensors we might need
+    # 3) Gather the data from the selected sensors.
     # --------------------------------------------------------
-    # jitter for the "< min" case (add -inf to kept indices so they are ignored)
-    jitter = torch.randn_like(phi_flat) * 0.01
-    cand_lo = torch.where(keep_mask, torch.full_like(phi_flat, -1e9), phi_flat + jitter)
-    idx_top_min   = cand_lo.topk(k=min_r, dim=1).indices          # [B, min_r]
+    # Original shape: [B, num_to_keep]; Target shape:   [B, T, num_to_keep, N_call]
+    # We need to expand it to match the dimensions of G_d for gathering along dim=2.
+    idx_batch = top_indices.unsqueeze(1).unsqueeze(-1)      # Shape: [B, 1, num_to_keep, 1]
+    idx_batch = idx_batch.expand(-1, T, -1, N_call)         # Shape: [B, T, num_to_keep, N_call]
 
-    # plain top-k for the "> max" or exploration case
-    idx_top_max   = phi_flat.topk(k=max_r, dim=1).indices         # [B, max_r]
+    # Gather the data for the selected sensors. The size of dimension 2 is now `num_to_keep`.
+    G_d_sel = torch.gather(G_d, dim=2, index=idx_batch)
 
-    # --------------------------------------------------------
-    # 5) build the final index matrix [B, K_max]
-    # --------------------------------------------------------
-    # start with padded tensor filled with dummy value (N_x-1 is always valid)
-    dummy     = N_x - 1
-    idx_batch = torch.full((B, max_r), dummy,
-                           dtype=torch.long, device=device)
-
-    # ---- case 1: K between [min_r, max_r] --------------------------------
-    ok_mask   = (k_keep >= min_r) & (k_keep <= max_r)
-    if ok_mask.any():
-        arange = torch.arange(N_x, device=device).expand(ok_mask.sum(), -1)
-        idx_batch[ok_mask, :max_r] = torch.where(
-            keep_mask[ok_mask],
-            arange,
-            dummy
-        )
-        # compact to the left
-        idx_batch[ok_mask] = idx_batch[ok_mask].sort(dim=1).values.flip(dims=[1])
-
-    # ---- case 2: K < min_r  ----------------------------------------------
-    small_mask = k_keep < min_r
-    if small_mask.any():
-        idx_batch[small_mask, :min_r] = idx_top_min[small_mask]
-
-    # ---- case 3: K > max_r  ----------------------------------------------
-    large_mask = k_keep > max_r
-    if large_mask.any():
-        idx_batch[large_mask] = idx_top_max[large_mask]
-
-    # real number of retained sensors
-    keep_len = torch.minimum(k_keep.clamp(min=min_r), torch.tensor(max_r, device=device))
-
-    idx_batch = idx_batch.unsqueeze(1).unsqueeze(-1)      # [B,1,K_max,1]
-    idx_batch = idx_batch.expand(-1, T, -1, N_call)       # [B,T,K_max,N_call]
-
-    G_d_sel   = torch.gather(G_d, dim=2, index=idx_batch) # [B,T,K_max,N_call]
-
-    return G_d_sel, keep_len[0]
+    return G_d_sel, num_to_keep
 
 # Helper for ELBO (orthogonalized from loop)
 def compute_elbo(base_model, uncert, coords, stage, cfg):
@@ -358,6 +314,9 @@ def train(cfg: dict):
 
     retain_cls             = cfg.get("retain_cls", False) # if Use_Adaptive_Selection else False
     Supervise_Sensors      = cfg.get("Supervise_Sensors", False)  # if Use_Adaptive_Selection else False
+
+    BATCH_DOWNSAMPLE       = cfg.get("BATCH_DOWNSAMPLE", False) # if we further downsample G_d in each batch
+    DOWNSAMPLE_LOGIC       = cfg.get("DOWNSAMPLE_LOGIC", "random") # random or optimal. if optimal, use select_and_gather_batch()
 
     model, Net_Name = build_model(cfg, N_c)
 
@@ -489,9 +448,35 @@ def train(cfg: dict):
             G_d, G_dt, G_f, Y, U = map(lambda x: x.to(device), (G_d, G_dt, G_f, Y, U))
             B, num_time_sample, N_x, N_call = G_d.shape  
 
+            downsample_ratio = 1.0
+            if BATCH_DOWNSAMPLE:
+                # Generate a random ratio for this specific batch in the range [0.25, 1.0].
+                ratio = torch.rand(1).item() * 0.75 + 0.25
+                downsample_ratio = ratio  # Store the ratio for loss scaling later.
+                # print(f'downsample_ratio is {downsample_ratio}')
+
+                if DOWNSAMPLE_LOGIC == "optimal":
+                    G_d_sel, num_to_keep = select_and_gather_batch(G_d, base_model, epoch, cfg, downsample_ratio)
+                    G_d = G_d_sel
+
+                elif DOWNSAMPLE_LOGIC == "random":
+                    # Calculate the number of spatial points to keep.
+                    num_to_keep = max(1, int(N_x * ratio))
+                    # Generate a random permutation of indices along the spatial dimension (N_x)
+                    indices = torch.randperm(N_x, device=G_d.device)[:num_to_keep]
+                    # Reshape and expand the indices to be compatible with torch.gather.
+                    indices = indices.view(1, 1, num_to_keep, 1)
+                    indices = indices.expand(B, num_time_sample, -1, N_call)
+                    # 5. Create the downsampled subset of G_d by gathering along dimension 2.
+                    G_d = torch.gather(G_d, dim=2, index=indices)
+                else:
+                    print(' Error in DOWNSAMPLE_LOGIC! Should be either "random" or "optimal" ')
+                    exit()
+
             opt.zero_grad()
             out, out_logvar, obs, traj, traj_logvar, G_u_cls, G_u_mean_Sens, G_u_logvar_Sens = model(G_d, G_f, Y, U, teacher_force_p)
 
+            # Compute NLL loss
             nll_loss = 0.0
             if CalRecVar and stage == 0:
                 var = torch.exp(out_logvar) + 1e-6  # [B, T, P, C] variance (positive)
@@ -581,19 +566,6 @@ def train(cfg: dict):
             else:
                 loss_mse  = mse(out, G_f)
 
-            # if retain_cls is True and G_u_cls is not None:
-            #     if N_c > 1:
-            #         loss_mse_channels_cls = []
-            #         for ci in range(N_c):
-            #             if stage == 2:
-            #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-            #             else:
-            #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-            #             loss_mse_channels_cls.append(loss_channel)
-            #         loss_U  = w_cls * sum(loss_mse_channels_cls)
-            #     else:
-            #         loss_U  = w_cls * mse(G_u_cls, G_f)
-            # else: loss_U = 0.0
             loss_U = 0.0
 
             if stage == 0 and Supervise_Sensors:
@@ -607,7 +579,7 @@ def train(cfg: dict):
             
             loss_kl   = elbo_loss   # Use kl term to document elbo loss only in train loop
 
-            loss = loss_mse + loss_obs + loss_traj + loss_kl + loss_U + nll_loss + l_psd + l_spectrum
+            loss = (loss_mse + loss_obs) * downsample_ratio + loss_traj + loss_kl + loss_U + nll_loss + l_psd + l_spectrum
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -953,11 +925,11 @@ def train(cfg: dict):
 
             # early-stopping & checkpoint
 
-            if avg_test_loss_mse < best_test: 
-                best_test, epochs_no_imp = avg_test_loss_mse, 0
+            # if avg_test_loss_mse < best_test: 
+            #     best_test, epochs_no_imp = avg_test_loss_mse, 0
             
-            # if avg_train_loss_mse < best_test:
-            #     best_test, epochs_no_imp = avg_train_loss_mse, 0
+            if avg_train_loss_mse < best_test:
+                best_test, epochs_no_imp = avg_train_loss_mse, 0
 
                 ckpt_dir = pathlib.Path(cfg["save_net_dir"]); ckpt_dir.mkdir(exist_ok=True, parents=True)
                 state_dict = (model.module if isinstance(model, nn.DataParallel) else model).state_dict()

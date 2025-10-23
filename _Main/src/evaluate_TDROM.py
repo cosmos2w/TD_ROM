@@ -249,6 +249,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
 def load_data(cfg, args):
     torch.manual_seed(args.seed)
     fields, coords, time_vec, conditions = load_h5_data(cfg["data_h5"])
+    print(f'fields.shape is {fields.shape}')
     B, T_total, N_x, N_y, N_c_tot = fields.shape
     N_pts = N_x * N_y
     return fields, coords, time_vec, conditions, B, T_total, N_pts, N_c_tot
@@ -401,9 +402,10 @@ def perform_inference(model, G_down, G_full, coords_, U_vec, inv, CalRecVar):
 
 # -------------------------------------------------------------- 9. Evaluation
 def evaluate(u_true_phys, u_pred_phys, recon_idx):
+
     u_true_recon = u_true_phys[:, recon_idx, :]
     
-    # Compute MSE (as before)
+    # Compute MSE
     mse_ch = torch.mean((u_true_recon - u_pred_phys) ** 2, dim=(0, 1))
     global_mse = float(mse_ch.mean())
     print(f"Global MSE = {global_mse:.4e}")
@@ -431,7 +433,7 @@ def evaluate(u_true_phys, u_pred_phys, recon_idx):
     return global_mse, global_l2_abs, global_l2_rel
 
 # -------------------------------------------------------------- 10. Plot Results
-def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time_vec, args, cfg, global_mse):
+def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time_vec, args, cfg, global_mse, global_l2_rel):
 
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     show_ids = args.plot_ids if args.plot_ids else (0, len(time_vec) // 2, len(time_vec) - 1)
@@ -643,7 +645,7 @@ def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time
         
         print(f"GIFs saved to '{out_dir}'")
 
-    print(f"All figures written to '{out_dir}'  (global MSE = {global_mse:.4e})")
+    print(f"All figures written to '{out_dir}'  (global MSE = {global_mse:.4e}, L2Norm = {global_l2_rel:.4e})")
 
 def reconstruct(cfg, args):
 
@@ -688,19 +690,19 @@ def reconstruct(cfg, args):
     print(f'global_mse: {global_mse}, global_l2_abs: {global_l2_abs}, global_l2_rel: {global_l2_rel}')
 
     # plot_results(u_true_full, u_pred_phys, recon_idx, xy_recon, xy_sensors, t_slice, args, cfg, global_mse)
-    plot_results(u_true_full, u_pred_phys, recon_idx, coords_recon, coords_obs, t_slice, args, cfg, global_l2_rel) 
+    plot_results(u_true_full, u_pred_phys, recon_idx, coords_recon, coords_obs, t_slice, args, cfg, global_mse, global_l2_rel) 
     
 def main():
     parser = argparse.ArgumentParser(description="TD-ROM Evaluation")
 
     parser.add_argument(
         "--dataset",
-        default="turbulent_combustion",
+        default="channel_flow",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=5, 
+    parser.add_argument('--indice', type=int, default=2, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=0, 
                         help='net checkpoint index: which stage')
@@ -709,23 +711,23 @@ def main():
     
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
-    parser.add_argument("--T_ini", type=int, default=3999,
+    parser.add_argument("--T_ini", type=int, default=1000,
                         help="Initial time index from which to start prediction")
     parser.add_argument("--N_pred", type=int, default=1,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=96,
+    parser.add_argument("--num_space_sample", type=int, default=50,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--Select_Optimal", type=bool, default=False,
                         help="Decide whether we select best sensors based on retain probability")
-    parser.add_argument("--Retain_Num", type=int, default=8,
+    parser.add_argument("--Retain_Num", type=int, default=4,
                         help="Decide the number of topK important sensors")
     
     parser.add_argument("--SAVE_GIF", action='store_true', default=False,
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")
-    parser.add_argument("--seed", type=int, default=0,
+    parser.add_argument("--seed", type=int, default=45,
                         help="Random seed for reproducibility")
     parser.add_argument("--plot_ids", type=int, nargs="*", default=None,
                    help="indices within the prediction window to plot "
