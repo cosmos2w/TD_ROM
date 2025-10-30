@@ -450,8 +450,8 @@ def train(cfg: dict):
 
             downsample_ratio = 1.0
             if BATCH_DOWNSAMPLE:
-                # Generate a random ratio for this specific batch in the range [0.25, 1.0].
-                ratio = torch.rand(1).item() * 0.75 + 0.25
+                # Generate a random ratio for this specific batch in the range [0.50, 1.0].
+                ratio = torch.rand(1).item() * 0.50 + 0.50
                 downsample_ratio = ratio  # Store the ratio for loss scaling later.
                 # print(f'downsample_ratio is {downsample_ratio}')
 

@@ -121,12 +121,12 @@ def _load_h5_to_ram(fp: pathlib.Path,
     else:
         raise ValueError(f"Unknown process_mode {process_mode!r}")
 
-    coords = torch.from_numpy(coords).squeeze(2)[..., :2]  # (N_x,N_y,2)
+    coords = torch.from_numpy(coords).squeeze(2)[..., :2]  # (N_x,N_y,2), for 2D datasets
     xy = coords.view(-1, 2)                                # (N_pts,2)
     xy_min, xy_max = xy.min(0).values, xy.max(0).values
 
     xy = (xy - xy_min) / (xy_max - xy_min)
-    xy = xy * 2.0 - 1.0                                    # converted to [-1, 1]
+    xy = xy * 2.0 - 1.0                                    # We will converted coordiante range into [-1, 1]
 
     t_vec = torch.from_numpy(t_vec)
     U_vec = torch.from_numpy(U)

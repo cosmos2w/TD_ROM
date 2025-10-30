@@ -112,16 +112,65 @@ class FourierEmbedding(nn.Module):
         proj = 2.0 * math.pi * xy @ self.B          # (..., M)
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
-class _CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
+class SpatiallyAwareCLSFusion(nn.Module):
+    """
+    Lightweight CLS fusion that adapts to query location.
+    Minimal overhead: just 2 small MLPs for gating.
+    """
+    def __init__(self, d_model: int):
         super().__init__()
-        self.attn = nn.MultiheadAttention(dim,
-                                          num_heads,
-                                          dropout=dropout,
-                                          batch_first=True)
-    def forward(self, q, k, v):
-        y, _ = self.attn(q, k, v, need_weights=False)
-        return y
+        # Simple gating mechanism
+        self.gate_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1),
+            nn.Sigmoid()
+        )
+        # Project CLS and local features
+        self.cls_proj = nn.Linear(d_model, d_model)
+        self.local_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, local_features, cls_features):
+        """
+        Args:
+            local_features: [B*T, P, d_model] - from sensor aggregation
+            cls_features: [B*T, 1, d_model] - global CLS token
+        Returns:
+            fused: [B*T, P, d_model]
+        """
+        # Expand CLS to all query points
+        cls_expanded = cls_features.expand(-1, local_features.size(1), -1)
+        # Compute adaptive gate based on local features
+        # (locations that need global info will have different gates)
+        gate = self.gate_net(local_features)  # [B*T, P, 1]
+        # Weighted fusion
+        cls_proj = self.cls_proj(cls_expanded)
+        local_proj = self.local_proj(local_features)
+        fused = gate * local_proj + (1 - gate) * cls_proj
+        return fused
+
+class CLSConditionedCoordEncoder(nn.Module):
+    """
+    Makes coordinate embeddings aware of global CLS context.
+    Negligible cost: just element-wise modulation.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.cls_to_modulation = nn.Linear(d_model, d_model)
+    def forward(self, coord_emb, cls_token):
+        """
+        Args:
+            coord_emb: [B*T, P, d_model] - base coordinate embeddings
+            cls_token: [B*T, 1, d_model] - global CLS
+        Returns:
+            modulated_emb: [B*T, P, d_model]
+        """
+        # CLS generates global modulation
+        modulation = self.cls_to_modulation(cls_token)  # [B*T, 1, d_model]
+        # Element-wise modulation (like FiLM)
+        # This makes coords domain-aware
+        modulated = coord_emb * (1.0 + 0.1 * torch.tanh(modulation))
+        return modulated
 
 class CrossAttention(nn.Module):
     def __init__(
@@ -3015,6 +3064,7 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             self.var_head = nn.Linear(self.d_model + 16, self.N_channels)  # Input now larger
 
         # --- params for phi incorporation ---
+        self.SpatiallyAwareCLSFusion = SpatiallyAwareCLSFusion(d_model)
         self.use_weighted_fusion = use_weighted_fusion
         self.phi_scale = phi_scale  # Scale factor to control phi's influence
         self.use_checkpoint = use_checkpoint
@@ -3198,17 +3248,20 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         
         local_out_mean = None
         if self.retain_cls:
-            cls_proj_bt  = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
+
+            # cls_proj_bt  = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
 
             local_pre    = coord_tok + local_lat
-            fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
-            fused_pre    = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
+            # fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
+            # fused_pre    = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
 
             # fused_concat = torch.cat([local_lat, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
             # fused_lat    = self.fusion_proj(fused_concat)
             # fused_pre    = coord_tok + fused_lat
 
             # fused_pre    = coord_tok + local_lat + cls_proj_bt
+
+            fused_pre = self.SpatiallyAwareCLSFusion( local_pre, cls_proj.reshape(B*T, 1, d_model)) 
 
             fused_x = self.norm(fused_pre)
             fused_x = fused_x + self.mlp(fused_x)

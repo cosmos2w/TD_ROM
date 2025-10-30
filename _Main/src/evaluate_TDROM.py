@@ -702,7 +702,7 @@ def main():
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=2, 
+    parser.add_argument('--indice', type=int, default=3, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=0, 
                         help='net checkpoint index: which stage')
@@ -727,7 +727,7 @@ def main():
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")
-    parser.add_argument("--seed", type=int, default=45,
+    parser.add_argument("--seed", type=int, default=15,
                         help="Random seed for reproducibility")
     parser.add_argument("--plot_ids", type=int, nargs="*", default=None,
                    help="indices within the prediction window to plot "
