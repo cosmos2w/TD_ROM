@@ -154,7 +154,7 @@ def evaluate(u_true_recon, u_pred_phys):
     
     return global_mse, global_l2_rel
 
-def _save_plot(
+def save_plot(
     u_true: np.ndarray,          # (Nt, Nx, Ny) *or* (Nt, Npts)
     u_pred: np.ndarray,          # same shape as u_true
     X: np.ndarray,               # (Npts, 2)   – columns: x, y
@@ -163,10 +163,28 @@ def _save_plot(
     out_dir: str | os.PathLike,  # directory (created if missing)
     *,
     sensor_coords: np.ndarray | None = None,
+
+    field_min_given: float | None = None,
+    field_max_given: float | None = None,   
+    err_min_given: float | None = None,
+    err_max_given: float | None = None,
+
     cmap_field: str = "viridis",
     cmap_err: str = "inferno",
     dpi: int = 300,
     N_window: int = 1,
+
+    # ---
+    # For adding contour lines for visual aid.
+    contour_levels: int | None = None,      # Number of contour lines. If None, no lines are drawn.
+    contour_linewidth: float = 0.5,         # Linewidth of the contour lines.
+    contour_alpha: float = 0.5,             # Alpha (transparency) of the contour lines.
+
+    # For scaling the x and y axes.
+    x_scale_factor: float | None = None,    # Scaling factor for the x-axis. e.g., 1.2 for 20% zoom out.
+    y_scale_factor: float | None = None,    # Scaling factor for the y-axis.
+    # ---
+
 ) -> None:
     """
     For each index in `timesteps` create a PNG with three panels:
@@ -219,13 +237,32 @@ def _save_plot(
     if not all(0 <= k < Nt for k in timesteps):
         raise ValueError(f"All timesteps must be between 0 and {Nt-1}.")
 
+    X_scaled = X.copy()
+    if sensor_coords is not None:
+        sensor_coords_scaled = sensor_coords.copy()
+    else:
+        sensor_coords_scaled = None
+    # Apply scaling factor to the x-coordinates if provided.
+    if x_scale_factor is not None:
+        X_scaled[:, 0] *= x_scale_factor
+        if sensor_coords_scaled is not None:
+            sensor_coords_scaled[:, 0] *= x_scale_factor
+    # Apply scaling factor to the y-coordinates if provided.
+    if y_scale_factor is not None:
+        X_scaled[:, 1] *= y_scale_factor
+        if sensor_coords_scaled is not None:
+            sensor_coords_scaled[:, 1] *= y_scale_factor
+
     # ------------- triangulation (once) ------------------------------------
     u_true = np.ma.masked_invalid(u_true)
     u_pred = np.ma.masked_invalid(u_pred)
 
-    x = X[:, 0]
-    y = X[:, 1]
-    triang = mtri.Triangulation(x, y)
+    # x = X[:, 0]
+    # y = X[:, 1]
+    # triang = mtri.Triangulation(x, y)
+    x_plot = X_scaled[:, 0]
+    y_plot = X_scaled[:, 1]
+    triang = mtri.Triangulation(x_plot, y_plot)
 
     # Mask every triangle that touches at least one NaN vertex *in u_pred*
     bad_vertices   = ~np.isfinite(u_pred[0])              # (Npts,)
@@ -233,15 +270,13 @@ def _save_plot(
     triang.set_mask(tri_mask)
 
     # ------------- colour limits (shared across all frames) -----------------
-    field_min = np.minimum(u_true.min(), u_pred.min())
-    field_max = np.maximum(u_true.max(), u_pred.max())
+
+    field_min = field_min_given if field_min_given is not None else np.minimum(u_true.min(), u_pred.min())
+    field_max = field_max_given if field_max_given is not None else np.maximum(u_true.max(), u_pred.max())
 
     err_all   = np.abs(u_true - u_pred)
-    err_min   = err_all[err_all > 0].min() if np.any(err_all > 0) else 0.0
-    err_max   = err_all.max()
-
-    # err_min   = 0.0
-    # err_max   = 0.50
+    err_min = err_min_given if err_min_given is not None else err_all[err_all > 0].min() if np.any(err_all > 0) else 0.0
+    err_max = err_max_given if err_max_given is not None else err_all.max()
 
     # ------------- export directory ----------------------------------------
     out_dir = Path(out_dir)
@@ -271,25 +306,43 @@ def _save_plot(
             triang, u_t, levels=100, cmap=cmap_field,
             vmin=field_min, vmax=field_max
         )
+        if contour_levels is not None:
+            ax_true.tricontour(
+                triang, u_t, levels=contour_levels, colors='gray',
+                linewidths=contour_linewidth, alpha=contour_alpha
+            )
+
         im_pred = ax_pred.tricontourf(
             triang, u_p, levels=100, cmap=cmap_field,
             vmin=field_min, vmax=field_max
         )
+        if contour_levels is not None:
+            ax_pred.tricontour(
+                triang, u_p, levels=contour_levels, colors='gray',
+                linewidths=contour_linewidth, alpha=contour_alpha
+            )
 
         im_err = ax_err.tricontourf(
             triang, err, levels=100, cmap=cmap_err,
             vmin=err_min, vmax=err_max
         )
-
-        # im_err = ax_err.tricontourf(
-        #     triang, err, levels=100, cmap=cmap_err,
-        #     norm=LogNorm(vmin=err_min, vmax=err_max)
-        # )
+        if contour_levels is not None:
+            ax_err.tricontour(
+                triang, err, levels=contour_levels, colors='gray',
+                linewidths=contour_linewidth, alpha=contour_alpha
+            )
 
         # ------------------- mark sensors ------------------------------------
-        if sensor_coords is not None and PLOT_SENSORS is True:
+        # if sensor_coords is not None and PLOT_SENSORS is True:
+        #     ax_true.scatter(
+        #         sensor_coords[:, 0], sensor_coords[:, 1],
+        #         s=6, c="none", edgecolors="green", linewidths=0.6,
+        #         marker="o", zorder=4, label="sensors"
+        #     )
+        #     ax_true.legend(frameon=False, loc="upper right", fontsize=8)
+        if sensor_coords_scaled is not None and PLOT_SENSORS is True:
             ax_true.scatter(
-                sensor_coords[:, 0], sensor_coords[:, 1],
+                sensor_coords_scaled[:, 0], sensor_coords_scaled[:, 1],
                 s=6, c="none", edgecolors="green", linewidths=0.6,
                 marker="o", zorder=4, label="sensors"
             )
@@ -326,7 +379,7 @@ def _save_plot(
         print(f"Saved {filename}")
 
 # Temporarily modified for channel flow
-def save_plot(
+def _save_plot(
     u_true: np.ndarray,          # (Nt, Nx, Ny) *or* (Nt, Npts)
     u_pred: np.ndarray,          # same shape as u_true
     X: np.ndarray,               # (Npts, 2)   – columns: x, y
@@ -335,6 +388,12 @@ def save_plot(
     out_dir: str | os.PathLike,  # directory (created if missing)
     *,
     sensor_coords: np.ndarray | None = None,
+
+    field_min_given: float | None = None,
+    field_max_given: float | None = None,   
+    err_min_given: float | None = None,
+    err_max_given: float | None = None,
+
     cmap_field: str = "viridis",
     cmap_err: str = "inferno",
     dpi: int = 300,
@@ -405,15 +464,13 @@ def save_plot(
     triang.set_mask(tri_mask)
 
     # ------------- colour limits (shared across all frames) -----------------
-    field_min = np.minimum(u_true.min(), u_pred.min())
-    field_max = np.maximum(u_true.max(), u_pred.max())
+
+    field_min = field_min_given if field_min_given is not None else np.minimum(u_true.min(), u_pred.min())
+    field_max = field_max_given if field_max_given is not None else np.maximum(u_true.max(), u_pred.max())
 
     err_all   = np.abs(u_true - u_pred)
-    err_min   = err_all[err_all > 0].min() if np.any(err_all > 0) else 0.0
-    err_max   = err_all.max()
-
-    # err_min   = 0.0
-    # err_max   = 0.50
+    err_min = err_min_given if err_min_given is not None else err_all[err_all > 0].min() if np.any(err_all > 0) else 0.0
+    err_max = err_max_given if err_max_given is not None else err_all.max()
 
     # ------------- export directory ----------------------------------------
     out_dir = Path(out_dir)
@@ -463,7 +520,7 @@ def save_plot(
         if sensor_coords is not None and PLOT_SENSORS is True:
             ax_true.scatter(
                 sensor_coords[:, 0], sensor_coords[:, 1],
-                s=6, c="none", edgecolors="green", linewidths=0.6,
+                s=10, c="none", edgecolors="green", linewidths=0.85,
                 marker="o", zorder=4, label="sensors"
             )
             ax_true.legend(frameon=False, loc="upper right", fontsize=8)

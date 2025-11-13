@@ -151,6 +151,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     domain_decompose       = cfg.get('domain_decompose', False)
     CalRecVar              = cfg.get("CalRecVar", False)
     retain_cls             = cfg.get("retain_cls", False)
+    retain_lat             = cfg.get("retain_lat", False)
     Use_imp_in_dyn         = cfg.get("Use_imp_in_dyn", False)
 
     if domain_decompose:
@@ -163,6 +164,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             latent_tokens   = cfg["latent_tokens"],
             pooling         = cfg["pooling"],
             retain_cls      = retain_cls,
+            retain_lat      = retain_lat,
         )
         print(f'\nBuilding Domain Adaptive Encoder as the sensor encoder!\n')
     else:
@@ -214,12 +216,14 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             d_model=cfg["F_dim"],
             num_heads=cfg["num_heads"],
             N_channels=N_c,
+            latent_tokens=cfg["latent_tokens"],
             # pe_module=encoder.embed['pos_embed'],
             
             importance_scale=cfg["importance_scale"],
             bandwidth_init=cfg["bandwidth_init"], top_k=cfg["top_k"], per_sensor_sigma=cfg["per_sensor_sigma"], 
-            CalRecVar = CalRecVar,
+            CalRecVar  = CalRecVar,
             retain_cls = retain_cls,
+            retain_lat = retain_lat,
         )
         print(f'\nBuilding SoftDomainAdaptiveReconstructor as the field reconstructor!\n')
     else:
@@ -235,7 +239,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
         net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec,
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"],
                     use_adaptive_selection = Use_Adaptive_Selection, CalRecVar = CalRecVar, 
-                    retain_cls = retain_cls, Use_imp_in_dyn = Use_imp_in_dyn)
+                    retain_cls = retain_cls, retain_lat = retain_lat, Use_imp_in_dyn = Use_imp_in_dyn)
         print(f'\nBuilding TD_ROM_Bay_DD as the model wrapper!\n')
     else:
         net = TD_ROM(encoder, decoder_lat, field_dec, 
@@ -435,6 +439,9 @@ def evaluate(u_true_phys, u_pred_phys, recon_idx):
 # -------------------------------------------------------------- 10. Plot Results
 def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time_vec, args, cfg, global_mse, global_l2_rel):
 
+    # print(f'u_true_phys.shape is {u_true_phys.shape}')
+    # print(f'u_pred_phys.shape is {u_pred_phys.shape}')
+
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     show_ids = args.plot_ids if args.plot_ids else (0, len(time_vec) // 2, len(time_vec) - 1)
     out_dir = pathlib.Path(cfg["save_recon_dir"])
@@ -457,10 +464,26 @@ def plot_results(u_true_phys, u_pred_phys, recon_idx, xy_recon, xy_sensors, time
             timesteps=show_ids,
             out_dir=ch_dir,
             sensor_coords=xy_sensors.cpu().numpy(),
+
+            field_min_given = args.field_min_given,
+            field_max_given = args.field_max_given,   
+            err_min_given   = args.err_min_given,
+            err_max_given   = args.err_max_given,
+
             cmap_field=args.cmap,
             cmap_err="inferno",
             dpi=150,
             N_window = N_window,
+
+            # For adding contour lines for visual aid.
+            contour_levels = 25,          # Number of contour lines. If None, no lines are drawn.
+            contour_linewidth = 0.5,     # Linewidth of the contour lines.
+            contour_alpha = 0.5,          # Alpha (transparency) of the contour lines.
+
+            # For scaling the x and y axes.
+            x_scale_factor = args.x_scale_factor,    # Scaling factor for the x-axis. e.g., 1.2 for 20% zoom out.
+            y_scale_factor = args.y_scale_factor,    # Scaling factor for the y-axis.
+
         )
 
     if args.N_pred > 1:
@@ -697,12 +720,12 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        default="channel_flow",
+        default="collinear_flow_Re40",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
 
-    parser.add_argument('--indice', type=int, default=3, 
+    parser.add_argument('--indice', type=int, default=2, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=0, 
                         help='net checkpoint index: which stage')
@@ -711,27 +734,37 @@ def main():
     
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
-    parser.add_argument("--T_ini", type=int, default=1000,
+    parser.add_argument("--T_ini", type=int, default=990,
                         help="Initial time index from which to start prediction")
     parser.add_argument("--N_pred", type=int, default=1,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=50,
+    parser.add_argument("--num_space_sample", type=int, default=32,
                         help="Number of spatial points to supply to the encoder")
-    
-    parser.add_argument("--Select_Optimal", type=bool, default=False,
-                        help="Decide whether we select best sensors based on retain probability")
-    parser.add_argument("--Retain_Num", type=int, default=4,
-                        help="Decide the number of topK important sensors")
     
     parser.add_argument("--SAVE_GIF", action='store_true', default=False,
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")
-    parser.add_argument("--seed", type=int, default=15,
+    parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for reproducibility")
     parser.add_argument("--plot_ids", type=int, nargs="*", default=None,
                    help="indices within the prediction window to plot "
                         "(e.g. --plot_ids 0 50 75)")
+    
+    parser.add_argument("--field_min_given", type=float, default=None,
+                   help="For visualization, manually set field_min")
+    parser.add_argument("--field_max_given", type=float, default=None,
+                   help="For visualization, manually set field_max")
+    parser.add_argument("--err_min_given", type=float, default=None,
+                   help="For visualization, manually set err_min")
+    parser.add_argument("--err_max_given", type=float, default=None,
+                   help="For visualization, manually set err_max")
+    
+    parser.add_argument("--x_scale_factor", type=float, default = None,
+                   help="Scaling factor for the x-axis")
+    parser.add_argument("--y_scale_factor", type=float, default = None,
+                   help="Scaling factor for the y-axis")
+
     args = parser.parse_args()
 
     script_dir = pathlib.Path(__file__).resolve().parent

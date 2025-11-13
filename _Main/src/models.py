@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from torchdiffeq import odeint
-from typing import Tuple, Callable, Optional
+from typing import Tuple, Callable, Optional, List
 from torch.utils.checkpoint import checkpoint
 from collections import deque
 
@@ -87,6 +87,8 @@ class MLP(nn.Module):
                 x = act(x)
         return x
 
+#   Gated Linear Unit with GELU
+#   Use one part of the signal to dynamically control (gate) another part.
 class GEGLU(nn.Module):
     def __init__(self, d_model, mult=4):
         super().__init__()
@@ -171,6 +173,236 @@ class CLSConditionedCoordEncoder(nn.Module):
         # This makes coords domain-aware
         modulated = coord_emb * (1.0 + 0.1 * torch.tanh(modulation))
         return modulated
+
+# ---------------- 1104 Global-local fusion blocks -----------------
+class GlobalLocalFusionAttention(nn.Module):
+    """
+    Fuses a batch of local feature sequences with a corresponding batch of 
+    global latent sets using cross-attention.
+
+    Works in reconstructor by:
+
+    output_chunks = []
+    x_for_var_chunks = []
+    # Reshape global latents once before the loop
+    global_latents_reshaped = global_latents.reshape(B*T, self.latent_tokens, d_model)
+    for i in range(0, P, self.block_size):
+        # Get the current chunk of local features
+        local_chunk = local_pre[:, i:i+self.block_size, :]
+        # Perform fusion on the chunk
+        fused_chunk = self.global_local_fusion(local_chunk, global_latents_reshaped)
+        # Project to output channels
+        fused_chunk = self.norm(fused_chunk)
+        fused_chunk = fused_chunk + self.mlp(fused_chunk)
+        out_chunk   = self.head(fused_chunk) # Shape: [B*T, chunk_size, C]
+        output_chunks.append(out_chunk)
+        x_for_var_chunks.append(fused_chunk)
+    # Concatenate chunks along the P dimension
+    out_mean_reshaped = torch.cat(output_chunks, dim=1) # Shape: [B*T, P, C]
+    out_mean          = out_mean_reshaped.view(B, T, P, C)
+    x_for_var         = torch.cat(x_for_var_chunks, dim=1)
+
+    """
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model, 
+            num_heads=num_heads, 
+            dropout=0.1, 
+            batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # Using GEGLU or a standard MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model)
+        )
+
+    def forward(self, local_feature_chunk, global_latents):
+        """
+        Args:
+            local_feature_chunk: [B*T, chunk_size, D] - A chunk of aggregated local features.
+            global_latents: [B*T, L, D] - The set of global latent tokens.
+        
+        Returns:
+            fused_chunk: [B*T, chunk_size, D] - Refined feature chunk.
+        """
+        # The local feature chunk is the Query. The global latents are Key and Value.
+        # Q: [B*T, chunk_size, D], K/V: [B*T, L, D]
+        # This is a standard cross-attention operation and is highly efficient.
+        global_context, _ = self.attn(
+            query=local_feature_chunk,
+            key=global_latents,
+            value=global_latents
+        )
+        
+        # Add & Norm (residual connection from the local feature)
+        fused = self.norm1(local_feature_chunk + global_context)
+        
+        # MLP block
+        fused = fused + self.mlp(fused)
+        fused = self.norm2(fused)
+        
+        return fused
+
+class GlobalAttentionPoolingFusion(nn.Module):
+    """
+    Fuses global and local features using a two-stage attention mechanism
+    that is efficient and effective.
+    1. Pools `L` global latents into `k` summary vectors.
+    2. Fuses `P` local features with these `k` summary vectors.
+    """
+    def __init__(self, d_model: int, num_heads: int, num_pool_tokens: int = 4):
+        super().__init__()
+        self.num_pool_tokens = num_pool_tokens
+        
+        # Learnable queries for the pooling stage
+        self.pool_queries = nn.Parameter(torch.randn(1, self.num_pool_tokens, d_model))
+        # Attention layer for pooling global latents
+        self.pool_attn = nn.MultiheadAttention(
+            embed_dim=d_model, 
+            num_heads=num_heads, 
+            batch_first=True
+        )
+        self.pool_norm = nn.LayerNorm(d_model)
+        # The main fusion cross-attention (local queries, pooled global is K/V)
+        self.fusion_attn = nn.MultiheadAttention(
+            embed_dim=d_model, 
+            num_heads=num_heads, 
+            batch_first=True
+        )
+        self.fusion_norm1 = nn.LayerNorm(d_model)
+        self.fusion_norm2 = nn.LayerNorm(d_model)
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model)
+        )
+
+    def forward(self, local_features, global_latents):
+        """
+        Args:
+            local_features: [B*T, P, D] - Aggregated local features.
+            global_latents: [B*T, L, D] - The set of global latent tokens.
+        
+        Returns:
+            fused_features: [B*T, P, D] - Refined features.
+        """
+        B_T = global_latents.size(0)
+        
+        # --- Stage 1: Pool Global Latents ---
+        # Expand learnable queries to the batch size
+        queries = self.pool_queries.expand(B_T, -1, -1)
+        # Attend from learnable queries to the global latents
+        # Q: [B*T, k, D], K/V: [B*T, L, D] -> Complexity is O(k*L), very small
+        pooled_global, _ = self.pool_attn(
+            query=queries,
+            key=global_latents,
+            value=global_latents
+        )
+        pooled_global = self.pool_norm(pooled_global) # Shape: [B*T, k, D]
+        # --- Stage 2: Fuse Local Features with Pooled Global Context ---
+        # Attend from local features to the pooled global summary
+        # Q: [B*T, P, D], K/V: [B*T, k, D] -> Complexity is O(P*k), efficient!
+        global_context, _ = self.fusion_attn(
+            query=local_features,
+            key=pooled_global,
+            value=pooled_global
+        )
+        # Add & Norm (residual from local features)
+        fused = self.fusion_norm1(local_features + global_context)
+        # MLP block
+        fused = fused + self.mlp(fused)
+        fused = self.fusion_norm2(fused)
+        
+        return fused
+
+class LocallyGuidedGlobalFusion(nn.Module):
+    """
+    Fuses global and local features using a dynamic, three-stage attention process.
+    1. Distills P local features into k summary queries.
+    2. Uses these k dynamic queries to probe L global latents.
+    3. Fuses the resulting global context back into the P local features.
+    
+    This makes the fusion process sensitive to the local context.
+    """
+    def __init__(self, d_model: int, num_heads: int, num_summary_tokens: int = 8):
+        super().__init__()
+        self.num_summary_tokens = num_summary_tokens
+        
+        # 1. Learnable queries for the initial local distillation step.
+        self.distillation_queries = nn.Parameter(torch.randn(1, self.num_summary_tokens, d_model))
+        
+        # Attention layer for Step 1: Distill local features.
+        self.local_distill_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.local_distill_norm = nn.LayerNorm(d_model)
+        
+        # Attention layer for Step 2: Query global latents with dynamic queries.
+        self.global_query_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.global_query_norm = nn.LayerNorm(d_model)
+
+        # Attention layer for Step 3: Final fusion.
+        self.fusion_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.fusion_norm1 = nn.LayerNorm(d_model)
+        self.fusion_norm2 = nn.LayerNorm(d_model)
+        
+        self.mlp = GEGLU(d_model, mult=4)
+
+    def forward(self, local_features, global_latents):
+        """
+        Args:
+            local_features: [B*T, P, D] - Aggregated local features.
+            global_latents: [B*T, L, D] - The set of global latent tokens.
+        
+        Returns:
+            fused_features: [B*T, P, D] - Refined features.
+        """
+        B_T = local_features.size(0)
+        
+        # --- Step 1: Distill Local Context to Create Dynamic Queries ---
+        # Expand distillation queries to the batch size.
+        distill_q = self.distillation_queries.expand(B_T, -1, -1)
+        
+        # Attend from learnable queries to the local features.
+        # Q: [B*T, k, D], K/V: [B*T, P, D] -> Complexity O(P*k)
+        dynamic_queries, _ = self.local_distill_attn(
+            query=distill_q,
+            key=local_features,
+            value=local_features
+        )
+        dynamic_queries = self.local_distill_norm(dynamic_queries) # Shape: [B*T, k, D]
+        
+        # --- Step 2: Use Dynamic Queries to Probe Global Context ---
+        # Attend from dynamic queries to the global latents.
+        # Q: [B*T, k, D], K/V: [B*T, L, D] -> Complexity O(k*L)
+        global_context, _ = self.global_query_attn(
+            query=dynamic_queries,
+            key=global_latents,
+            value=global_latents
+        )
+        global_context = self.global_query_norm(global_context) # Shape: [B*T, k, D]
+
+        # --- Step 3: Fuse Global Context back into Local Features ---
+        # Attend from local features to the distilled global context.
+        # Q: [B*T, P, D], K/V: [B*T, k, D] -> Complexity O(P*k)
+        refined_context, _ = self.fusion_attn(
+            query=local_features,
+            key=global_context,
+            value=global_context
+        )
+        
+        # Final residual connection and MLP block
+        fused = self.fusion_norm1(local_features + refined_context)
+        fused = fused + self.mlp(fused)
+        fused = self.fusion_norm2(fused)
+        
+        return fused
+
+# ------------------------------------------------------------------
 
 class CrossAttention(nn.Module):
     def __init__(
@@ -379,7 +611,6 @@ class FourierTransformerSpatialEncoder(nn.Module):
 
         return lat_vec
 
-# Revised 09.14
 # --------------------------------------------------
 #  Small re-usable building blocks
 # --------------------------------------------------
@@ -426,16 +657,31 @@ class DomainAdaptiveEncoder(nn.Module):
                  latent_tokens : int = 8,
                  pooling       : str = "none",      # currently ignored
                  *,
-                 retain_cls    : bool = False
+                 retain_cls    : bool = False,
+                 retain_lat    : bool = False,
+                 channel_to_encode: Optional[List[int]] = None,
                  ):
         super().__init__()
         assert pooling in ("mean", "cls", "none")
 
+        # --- Store channel selection and determine input size ---
+        self.channel_to_encode = channel_to_encode
+        if self.channel_to_encode is None:
+            # If no specific channels are given, use all N_channels
+            num_selected_channels = N_channels
+        else:
+            # If a list of channels is given, the number of channels is its length
+            # Add validation to ensure channel indices are valid
+            if max(self.channel_to_encode) >= N_channels or min(self.channel_to_encode) < 0:
+                raise ValueError(f"channel_to_encode contains indices out of range for N_channels={N_channels}")
+            num_selected_channels = len(self.channel_to_encode)
+            print(f"Encoder will use {num_selected_channels} specific channels: {self.channel_to_encode}")
+
         # 1. Positional + value projection sub-modules ---------------------------
-        self.embed = build_pos_value_proj(N_channels, num_freqs, All_dim)
+        self.embed = build_pos_value_proj(num_selected_channels, num_freqs, All_dim)
 
         # 2. Latent / CLS parameters --------------------------------------------
-        self.latents = build_latent_bank(All_dim, latent_tokens, with_cls=True)
+        self.latents = build_latent_bank(All_dim, latent_tokens, with_cls = retain_cls)
 
         # 3. Attention blocks ----------------------------------------------------
         self.cross_attn            = CrossAttention(All_dim, num_heads, dropout = 0.0,
@@ -455,6 +701,8 @@ class DomainAdaptiveEncoder(nn.Module):
         # -----------------------------------------------------------------------
         self.retain_cls = retain_cls
         print(f'self.retain_cls is {self.retain_cls} ! ')
+        self.retain_lat = retain_lat
+        print(f'self.retain_lat is {self.retain_lat} ! ')
 
     def forward(self,
                 coords_tuv   : torch.Tensor,                     # (B,T,N, 2+C)
@@ -467,8 +715,17 @@ class DomainAdaptiveEncoder(nn.Module):
         # ------------------------------------------------------------------ 
         # Split coordinates and sensor values
         xy   = coords_tuv[..., 0:2]                                            # (B,T,N,2)
-        C_in = self.embed['val_linear'].in_features
-        vals = coords_tuv[..., 2:2 + C_in]                                     # (B,T,N,C)
+        # C_in = self.embed['val_linear'].in_features
+        # vals = coords_tuv[..., 2:2 + C_in]                                     # (B,T,N,C)
+        # --- MODIFICATION 2: Select the correct value channels ---
+        if self.channel_to_encode is None:
+            C_in = self.embed['val_linear'].in_features
+            vals = coords_tuv[..., 2:2 + C_in]                                  # (B,T,N,C)
+        else:
+            # Select specific channels using advanced indexing.
+            # The value channels start at index 2 of the last dimension.
+            value_channels_in_tensor = [c + 2 for c in self.channel_to_encode]
+            vals = coords_tuv[..., value_channels_in_tensor]                   # (B,T,N, len(channel_to_encode))
 
         # Positional & value embeddings
         pos_tok = self.embed['pos_linear'](self.embed['pos_embed'](xy))
@@ -491,6 +748,8 @@ class DomainAdaptiveEncoder(nn.Module):
         lat = self.cross_norm(lat)
         lat = lat + self.cross_attn(lat, tok_flat, tok_flat)
         lat = lat + self.cross_latent_mixer(lat)
+        # Keep a copy of the final latents if we need to output them
+        final_latents = lat
 
         # ------------------------------------------------------------------ 
         # Feed refined latent information back into sensor tokens
@@ -501,14 +760,18 @@ class DomainAdaptiveEncoder(nn.Module):
         # tok_flat_out = tok_flat_up + self.token_to_latent(tok_flat_up, lat, lat)    # Skip the self-attn-based token_to_latent_mixer
 
         # ------------------------------------------------------------------ 
+        # retain_latents has higher prioriy
+        if self.retain_lat:
+            # The global tokens go first, then the local tokens
+            tok_flat_out = torch.cat([final_latents, tok_flat_out], dim=1)     # (B*T, L+N, D)
         # Optionally keep CLS as part of the output token set
-        if self.retain_cls:
+        elif self.retain_cls:
             cls_upd   = lat[:, :1, :]                                          # (B*T,1,D)
             tok_flat_out = torch.cat([cls_upd, tok_flat_out], dim=1)           # (B*T,1+N,D)
 
         # ------------------------------------------------------------------ 
         # Reshape back to (B,T,⋯)
-        S        = tok_flat_out.size(1)
+        S        = tok_flat_out.size(1) # This is 1+N, L+N or N
         lat_vec  = tok_flat_out.view(B, T, S, -1)                              # (B,T,S,D)
 
         mask     = torch.ones(B, T, S, dtype=torch.bool, device=lat_vec.device)
@@ -1065,7 +1328,7 @@ class MultiheadSoftmaxAttention(nn.Module):
             is_causal=True,
         )                             # B h 1 d
         y = y.squeeze(2)              # B h d
-        y = y.transpose(1, 2).reshape(B, self.d_model)
+        y = y.transpose(1, 2).contiguous().reshape(B, self.d_model)
         return self.out(y)
 
 class TemporalDecoderSoftmax(nn.Module):
@@ -1805,449 +2068,6 @@ class CAU_MultiheadCrossAttention(nn.Module):
         return restore_q(out)
 
 # Main Class: TemporalDecoderHierarchical
-class _TemporalDecoderHierarchical(nn.Module):
-
-    def __init__(
-        self,
-        d_model: int,
-        n_layers: int = 4,
-        n_heads: int = 4,
-        max_len: int = 4096,
-        dt: float = 0.02,
-        learnable_dt: bool = False,
-        dropout: float = 0.0,
-        rope_base: float = 1000.0,
-        checkpoint_every_layer: bool = True,
-        imp_threshold: float = 0.1,  # Mask if imp < threshold
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.rope_base = rope_base
-        self.imp_threshold = imp_threshold
-
-        # Hierarchical layers (Stack n_layers of hierarchical blocks)
-        self.cls_self_attns     = nn.ModuleList([MultiheadSoftmaxAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
-        self.cls_cross_attns    = nn.ModuleList([CAU_MultiheadCrossAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
-        # self.sensor_self_attns  = nn.ModuleList([MultiheadSoftmaxAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
-        self.sensor_cross_attns = nn.ModuleList([CAU_MultiheadCrossAttention(d_model, n_heads, dropout) for _ in range(n_layers)])
-
-        self.pre_norms  = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers * 2)])  # For CLS and sensors
-        self.post_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers * 2)])
-        self.ffns = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, 4 * d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(4 * d_model, d_model),
-            ) for _ in range(n_layers * 2)  # For CLS and sensors
-        ])
-
-        # Heun heads (separate for CLS and sensors)
-        self.cls_head    = nn.Linear(d_model, d_model)
-        self.sensor_head = nn.Linear(d_model, d_model)
-
-        # Learnable positional embedding
-        self.pos_emb = nn.Parameter(torch.randn(max_len, d_model) * 0.02)
-
-        # dt handling 
-        self.register_buffer("dt_const", torch.tensor(dt))
-        if learnable_dt:
-            self.dt_scale = nn.Parameter(torch.zeros(()))
-        else:
-            self.dt_scale = None
-
-        self.use_ckpt = checkpoint_every_layer
-
-    def apply_rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        """
-        Accepts:
-        x:  [B, T, M, D]  or [B, M, D] or [B, D]
-        pos: (1, T, 1) integer/float time indices
-        """
-        assert x.dim() in (2, 3, 4), f"apply_rope: unsupported x.dim={x.dim()}"
-        orig_dim = x.dim()
-
-        # Lift to 4D: [B, T, M, D]
-        if orig_dim == 2:          # [B, D] -> [B, 1, 1, D]
-            x = x.unsqueeze(1).unsqueeze(1)
-        elif orig_dim == 3:        # [B, M, D] -> [B, 1, M, D]
-            x = x.unsqueeze(1)
-        # else: already [B, T, M, D]
-
-        B, T, M, D = x.shape
-        assert D % 2 == 0, f"apply_rope: D must be even, got D={D}"
-        d = D // 2
-
-        # Frequencies and angles
-        freq = self.rope_base ** (-torch.arange(d, device=x.device, dtype=x.dtype) / d)  # [d]
-        # pos: [1, T, 1] -> [1, T, 1, 1], broadcast with freq -> [1, T, 1, d]
-        angle = pos.to(x.dtype).unsqueeze(-1) * freq.view(1, 1, 1, d)
-
-        s, c = angle.sin(), angle.cos()
-        x1, x2 = x[..., :d], x[..., d:]  # [B, T, M, d]
-        xr = torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)  # [B, T, M, D]
-
-        # Restore original rank
-        if orig_dim == 2: xr = xr.squeeze(1).squeeze(1)    # -> [B, D]
-        elif orig_dim == 3: xr = xr.squeeze(1)             # -> [B, M, D]
-
-        return xr
-
-    def _add_pos(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        """
-        Adds rotary position embeddings to x. Accepts x with shape:
-        - [B, T, M, D]  (T steps)
-        - [B, M, D]     (T=1)
-        - [B, D]        (T=1, M=1)
-        """
-        if x.dim() == 4:
-            T = x.shape[1]
-        elif x.dim() in (2, 3):
-            T = 1
-        else:
-            raise ValueError(f"_add_pos: unsupported x.dim={x.dim()}")
-        pos = torch.arange(offset, offset + T, device=x.device, dtype=x.dtype).view(1, T, 1)  # [1, T, 1]
-        return self.apply_rope(x, pos)
-
-    def _ensure_imp(self, imp, *, B: int, N_s: int, device, dtype=torch.float32):
-        if imp is None:
-            return torch.ones(B, N_s, device=device, dtype=dtype)
-        return imp
-
-    def _effective_dt(self):
-        if self.dt_scale is None:
-            return self.dt_const
-        return self.dt_const * F.softplus(self.dt_scale)
-
-    # ------------------------------------------------------------------
-    # Hierarchical Block (core layer)
-    # ------------------------------------------------------------------
-    def _block(
-        self,
-        idx: int,
-        cls: torch.Tensor,
-        sensors: torch.Tensor,
-        imp: torch.Tensor,
-        *,
-        incremental: bool,
-        append: bool = True,  # New: Pass to .step() for no-append mode
-    ) -> tuple:
-        """
-        Core hierarchical layer.
-
-        cls     : [B, T, 1, D] (parallel)  or [B, 1, D] (incremental)
-        sensors : [B, T, N_s, D]           or [B, N_s, D]
-        imp     : [B, N_s]
-        """
-
-        # -----------------------------------------------------------
-        # 1.  Resolve shapes
-        # -----------------------------------------------------------
-        if cls.dim() == 4:                              # parallel mode
-            B, T, _, D = cls.shape
-        elif cls.dim() == 3:                            # incremental mode
-            B, _, D = cls.shape
-            T = 1                                       # single-step
-        else:
-            raise ValueError("Unexpected cls shape")
-
-        if sensors.dim() == 4:                          # parallel
-            _, _, N_s, _ = sensors.shape
-        elif sensors.dim() == 3:                        # incremental
-            _, N_s, _ = sensors.shape
-        else:
-            raise ValueError("Unexpected sensors shape")
-
-        # -----------------------------------------------------------
-        # 2.  CLS stream
-        # -----------------------------------------------------------
-        cls_residual = cls
-        cls_normed = self.pre_norms[idx](cls)  # [B, T, 1, D] or [B, 1, D]
-
-        # Squeeze for attention compatibility (solution for CLS without revising attention class)
-        cls_squeezed = cls_normed.squeeze(2 if not incremental else 1)  # [B, T, D] or [B, D]
-        if incremental:
-            cls_attn = self.cls_self_attns[idx].step(cls_squeezed)
-        else:
-            cls_attn = self.cls_self_attns[idx](cls_squeezed)
-        # Unsqueeze back
-        cls_attn = cls_attn.unsqueeze(2 if not incremental else 1)  # [B, T, 1, D] or [B, 1, D]
-        # cls_attn = cls_normed
-
-        if incremental:
-            cls_cross = self.cls_cross_attns[idx].step(cls_normed, sensors, imp, append=append)
-        else:
-            cls_cross = self.cls_cross_attns[idx](cls_normed, sensors, imp)
-        cls = cls_attn + cls_cross
-        
-        cls = self.post_norms[idx](cls_residual + cls)
-        cls = cls + self.ffns[idx](cls)
-
-        # -----------------------------------------------------------
-        # 3.  Sensor stream
-        # -----------------------------------------------------------
-        # LayerNorm across all sensors at each time-step
-        sensors = self.pre_norms[idx + self.n_layers](sensors)  # [B, T, N_s, D] or [B, 1, N_s, D]
-
-        # First self-attention per sensor
-        if incremental:
-            sensors_sa = sensors.view(B * N_s, D)                  # [B·N_s, D]
-            # sensors_sa = self.sensor_self_attns[idx].step(sensors_sa)
-            sensors = sensors_sa.view(B, 1, N_s, D)
-        else:
-            sensors_sa = sensors.view(B * N_s, T, D)               # [B·N_s, T, D]
-            # sensors_sa = self.sensor_self_attns[idx](sensors_sa)
-            sensors = sensors_sa.view(B, T, N_s, D)
-
-        # Cross attention (sensor → CLS)
-        if incremental:
-            sensors = sensors + self.sensor_cross_attns[idx].step(sensors, cls, imp)
-        else:
-            sensors = sensors + self.sensor_cross_attns[idx](sensors, cls, imp)
-
-        # Post-norm + feed-forward
-        sensors = self.post_norms[idx + self.n_layers](sensors)
-        sensors = sensors + self.ffns[idx + self.n_layers](sensors)
-
-        # -----------------------------------------------------------
-        # 4.  Importance masking
-        # -----------------------------------------------------------
-        # mask = (imp.unsqueeze(1).unsqueeze(-1) >= self.imp_threshold)  # [B, 1, N_s, 1]
-        # sensors = sensors * mask.float()
-
-        return cls, sensors
-
-    def _block_ckpt(self, idx: int, cls: torch.Tensor, sensors: torch.Tensor, imp: torch.Tensor) -> tuple:
-        if not (self.use_ckpt and self.training):
-            return self._block(idx, cls, sensors, imp, incremental=False)
-
-        def fn(c, s, i):
-            return self._block(idx, c, s, i, incremental=False)
-        return cp.checkpoint(fn, cls, sensors, imp, use_reentrant=False)
-
-
-    def forward(self, x_seq: torch.Tensor, imp: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        x_seq: [B, T, 1 + N_s, D]
-        imp: [B, N_s]
-        """
-        B, T, M, D = x_seq.shape
-        N_s = M - 1
-
-        imp = self._ensure_imp(imp, B=B, N_s=N_s, device=x_seq.device, dtype=x_seq.dtype)
-
-        x_seq = self._add_pos(x_seq, 0)
-        cls = x_seq[:, :, :1, :]  # [B, T, 1, D]
-        sensors = x_seq[:, :, 1:, :]  # [B, T, N_s, D]
-
-        for idx in range(self.n_layers):
-            cls, sensors = self._block_ckpt(idx, cls, sensors, imp)
-
-        # Hierarchical Heun (aligns with framework: Evolve CLS first, then sensors)
-        dt = self._effective_dt()
-        k1_cls = self.cls_head(cls)
-        k1_sensors = self.sensor_head(sensors)
-        cls_mid = cls + dt * k1_cls
-        sensors_mid = sensors + dt * k1_sensors
-        # Pass mid through no-ckpt forward
-        cls_mid, sensors_mid = self._forward_no_ckpt(cls_mid, sensors_mid, imp)
-        k2_cls = self.cls_head(cls_mid)
-        k2_sensors = self.sensor_head(sensors_mid)
-        cls_next = cls + 0.5 * dt * (k1_cls + k2_cls)
-        sensors_next = sensors + 0.5 * dt * (k1_sensors + k2_sensors)
-
-        return torch.cat([cls_next, sensors_next], dim=2)  # [B, T, 1 + N_s, D]
-
-
-    def rollout_with_grad(
-        self,
-        obs_window: torch.Tensor,  # [B, T_obs, 1 + N_s, D]
-        N_fore: int,
-        imp: torch.Tensor | None = None,  # [B, N_s]
-        *,
-        truncate_k: int | None = 64,
-        teacher_force_seq: torch.Tensor | None = None,
-        teacher_force_prob: float = 0.0,
-    ) -> torch.Tensor:
-        assert self.training, "Call only in training mode"
-        B, T_obs, M, D = obs_window.shape
-        N_s = M - 1
-        dev = obs_window.device
-        imp = self._ensure_imp(imp, B=B, N_s=N_s, device=obs_window.device, dtype=obs_window.dtype)
-
-        # Reset states (hierarchical caches)
-        for l in range(self.n_layers):
-            self.cls_self_attns[l].reset_state(B, dev)
-            self.cls_cross_attns[l].reset_state(B, dev)
-            # self.sensor_self_attns[l].reset_state(B * N_s, dev)  # Batched for sensors
-            self.sensor_cross_attns[l].reset_state(B, dev)
-
-        # 1. Prime prefix
-        outputs = []
-        for t in range(T_obs):
-            token_raw = obs_window[:, t]  # [B, 1 + N_s, D]
-            token_pe = self._add_pos(token_raw.unsqueeze(1), t).squeeze(1)  # [B, 1 + N_s, D]
-            cls_t = token_pe[:, :1, :]
-            sensors_t = token_pe[:, 1:, :]
-            _ = self._step_layers(cls_t, sensors_t, imp)  # Builds caches
-            outputs.append(token_raw)
-
-        # 2. Autoregressive prediction with hierarchical Heun
-        dt_eff = self._effective_dt()
-        steps_left = N_fore - T_obs
-        latent_cur = obs_window[:, -1]  # [B, 1 + N_s, D]
-        cls_cur = latent_cur[:, :1, :]
-        sensors_cur = latent_cur[:, 1:, :]
-
-        for step in range(steps_left):
-            pos_idx = T_obs + step
-            cls_y, sensors_y = self._step_layers(
-                self._add_pos(cls_cur.unsqueeze(1), pos_idx).squeeze(1),
-                self._add_pos(sensors_cur.unsqueeze(1), pos_idx).squeeze(1),
-                imp,
-                append=True  # Append for k1
-            )
-
-            k1_cls = self.cls_head(cls_y)                  # [B, 1, D]
-            k1_sensors = self.sensor_head(sensors_y)       # [B, 1, N_s, D]
-            if k1_sensors.dim() == 4:
-                k1_sensors = k1_sensors.squeeze(1)         # -> [B, N_s, D]
-
-            # Midpoint
-            cls_mid = cls_cur + dt_eff * k1_cls              # [B, 1, D]
-            sensors_mid = sensors_cur + dt_eff * k1_sensors  # [B, N_s, D]
-
-            # Evaluate at midpoint (no append to avoid double-growth)
-            cls_mid_y, sensors_mid_y = self._step_layers(
-                self._add_pos(cls_mid.unsqueeze(1), pos_idx).squeeze(1),
-                self._add_pos(sensors_mid.unsqueeze(1), pos_idx).squeeze(1),
-                imp,
-                append=False  # New: No-append for midpoint
-            )
-
-            k2_cls = self.cls_head(cls_mid_y)              # [B, 1, D]
-            k2_sensors = self.sensor_head(sensors_mid_y)   # [B, 1, N_s, D]
-            if k2_sensors.dim() == 4:
-                k2_sensors = k2_sensors.squeeze(1)         # -> [B, N_s, D]
-
-            # Heun update
-            cls_next = cls_cur + 0.5 * dt_eff * (k1_cls + k2_cls)                   # [B, 1, D]
-            sensors_next = sensors_cur + 0.5 * dt_eff * (k1_sensors + k2_sensors)   # [B, N_s, D]
-            latent_next = torch.cat([cls_next, sensors_next], dim=1)                # [B, 1 + N_s, D]
-
-            outputs.append(latent_next)
-
-            # Teacher forcing
-            use_tf = (teacher_force_seq is not None and step < teacher_force_seq.size(1) and
-                      torch.rand((), device=dev) < teacher_force_prob)
-            latent_cur = teacher_force_seq[:, step] if use_tf else latent_next
-            cls_cur = latent_cur[:, :1, :]
-            sensors_cur = latent_cur[:, 1:, :]
-
-            # Truncated BPTT
-            if truncate_k and ((step + 1) % truncate_k == 0):
-                for l in range(self.n_layers):
-                    for attn in [self.cls_self_attns[l], 
-                                 self.cls_cross_attns[l],
-                                #  self.sensor_self_attns[l], 
-                                 self.sensor_cross_attns[l]
-                                 ]:
-                        if attn.K is not None:
-                            attn.K = attn.K.detach()
-                            attn.V = attn.V.detach()
-
-        return torch.stack(outputs, 1)  # [B, N_fore, 1 + N_s, D]
-
-    # ------------------------------------------------------------------
-    # Greedy generation (no grad) – evaluation / inference
-    # No-grad autoregressive, hierarchical
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def generate(self, obs_window: torch.Tensor, N_fore: int, imp: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        obs_window: [B, T_obs, 1 + N_s, D]
-        imp: [B, N_s]
-        returns: [B, N_fore, 1 + N_s, D]
-        """
-        B, T_obs, M, _ = obs_window.shape
-        N_s = M - 1
-        dev = obs_window.device
-        imp = self._ensure_imp(imp, B=B, N_s=N_s, device=obs_window.device, dtype=obs_window.dtype)
-
-        # Reset states
-        for l in range(self.n_layers):
-            self.cls_self_attns[l].reset_state(B, dev)
-            self.cls_cross_attns[l].reset_state(B, dev)
-            # self.sensor_self_attns[l].reset_state(B * N_s, dev)
-            self.sensor_cross_attns[l].reset_state(B, dev)
-
-        out = []
-        for t in range(T_obs):
-            token_raw = obs_window[:, t]
-            token_pe = self._add_pos(token_raw.unsqueeze(1), t).squeeze(1)
-            cls_t = token_pe[:, :1, :]
-            sensors_t = token_pe[:, 1:, :]
-            _ = self._step_layers(cls_t, sensors_t, imp)
-            out.append(token_raw)
-
-        dt = self._effective_dt()
-        latent_cur = obs_window[:, -1]
-        cls_cur = latent_cur[:, :1, :]
-        sensors_cur = latent_cur[:, 1:, :]
-
-        for step in range(N_fore - T_obs):
-            pos_idx = T_obs + step
-            cls_y, sensors_y = self._step_layers(
-                self._add_pos(cls_cur.unsqueeze(1), pos_idx).squeeze(1),
-                self._add_pos(sensors_cur.unsqueeze(1), pos_idx).squeeze(1),
-                imp,
-                append=True  # Append for k1
-            )
-
-            # k1
-            k1_cls = self.cls_head(cls_y)                  # [B, 1, D]
-            k1_sensors = self.sensor_head(sensors_y)       # [B, 1, N_s, D]
-            if k1_sensors.dim() == 4:
-                k1_sensors = k1_sensors.squeeze(1)         # -> [B, N_s, D]
-            # Midpoint
-            cls_mid = cls_cur + dt * k1_cls
-            sensors_mid = sensors_cur + dt * k1_sensors
-            # Evaluate at midpoint (no append)
-            cls_mid_y, sensors_mid_y = self._step_layers(
-                self._add_pos(cls_mid.unsqueeze(1), pos_idx).squeeze(1),
-                self._add_pos(sensors_mid.unsqueeze(1), pos_idx).squeeze(1),
-                imp,
-                append=False  # New: No-append for midpoint
-            )
-            # k2
-            k2_cls = self.cls_head(cls_mid_y)              # [B, 1, D]
-            k2_sensors = self.sensor_head(sensors_mid_y)   # [B, 1, N_s, D]
-            if k2_sensors.dim() == 4:
-                k2_sensors = k2_sensors.squeeze(1)         # -> [B, N_s, D]
-            # Update
-            cls_cur = cls_cur + 0.5 * dt * (k1_cls + k2_cls)
-            sensors_cur = sensors_cur + 0.5 * dt * (k1_sensors + k2_sensors)
-
-            latent_cur = torch.cat([cls_cur, sensors_cur], dim=1)  # [B, 1 + N_s, D]
-            out.append(latent_cur)
-
-        return torch.stack(out, 1)
-
-    # ------------------------------------------------------------------
-    # Shared utilities
-    # ------------------------------------------------------------------
-    def _forward_no_ckpt(self, cls: torch.Tensor, sensors: torch.Tensor, imp: torch.Tensor) -> tuple:
-        for idx in range(self.n_layers):
-            cls, sensors = self._block(idx, cls, sensors, imp, incremental=False)
-        return cls, sensors
-
-    def _step_layers(self, cls_t: torch.Tensor, sensors_t: torch.Tensor, imp: torch.Tensor, append: bool = True) -> tuple:
-        for idx in range(self.n_layers):
-            cls_t, sensors_t = self._block(idx, cls_t, sensors_t, imp, incremental=True, append=append)  # New: Pass append
-        return cls_t, sensors_t
-
 # Revised 0922
 class TemporalDecoderHierarchical(nn.Module):
 
@@ -2482,12 +2302,20 @@ class TemporalDecoderHierarchical(nn.Module):
         # -----------------------------------------------------------
         # 3.  Sensor stream
         # -----------------------------------------------------------
+
+        # sensors_residual = sensors
+
+        # sensors_normed = self.pre_norms[idx + self.n_layers](sensors)
+        # sensors_cross = self.sensor_cross_attns[idx](sensors_normed, cls, imp_weights=None)
+        # sensors = sensors_cross # Or sensors_sa + sensors_cross if self-attn is used
+
+        # sensors = self.post_norms[idx + self.n_layers](sensors_residual + sensors)
+        # sensors = sensors + self.ffns[idx + self.n_layers](sensors)
+
         sensors = self.pre_norms[idx + self.n_layers](sensors)  # [B, T, N_s, D]
-
-        sensors_sa = sensors.view(B * N_s, T, D)  # [B*N_s, T, D]
+        # sensors_sa = sensors.view(B * N_s, T, D)  # [B*N_s, T, D]
         # sensors_sa = self.sensor_self_attns[idx](sensors_sa)  # Uncomment if needed
-        sensors = sensors_sa.view(B, T, N_s, D)
-
+        # sensors = sensors_sa.view(B, T, N_s, D)
         sensors = sensors + self.sensor_cross_attns[idx](sensors, cls, imp_weights = None) # Sensor attend to CLS do not need imp
 
         sensors = self.post_norms[idx + self.n_layers](sensors)
@@ -2592,7 +2420,8 @@ class TemporalDecoderHierarchical(nn.Module):
         imp = self._ensure_imp(imp, B=B, N_s=N_s, device=obs_window.device, dtype=obs_window.dtype)
 
         # Initialize rolling window as deque (maxlen=n_window)
-        history = deque(maxlen=self.n_window)
+        # history = deque(maxlen=self.n_window)
+        history = deque(maxlen=T_obs)
         for t in range(T_obs):
             history.append(obs_window[:, t])  # [B, 1 + N_s, D]
 
@@ -2654,7 +2483,8 @@ class TemporalDecoderHierarchical(nn.Module):
 
             # Truncated BPTT (simulate by detaching history every truncate_k steps)
             if truncate_k and ((step + 1) % truncate_k == 0):
-                history = deque([h.detach() for h in history], maxlen=self.n_window)
+                # history = deque([h.detach() for h in history], maxlen=self.n_window)
+                history = deque([h.detach() for h in history], maxlen=T_obs)
 
             # Update current
             latent_cur = history[-1]
@@ -2680,7 +2510,8 @@ class TemporalDecoderHierarchical(nn.Module):
         imp = self._ensure_imp(imp, B=B, N_s=N_s, device=obs_window.device, dtype=obs_window.dtype)
 
         # Rolling window seeded with observed tokens
-        history = deque(maxlen=self.n_window)
+        # history = deque(maxlen=self.n_window)
+        history = deque(maxlen=T_obs)
         for t in range(T_obs):
             history.append(obs_window[:, t])  # [B, 1 + N_s, D]
 
@@ -2995,6 +2826,7 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         d_model: int,
         num_heads: int,
         N_channels: int,
+        latent_tokens : int,
 
         num_freqs: int = 64,
         dropout: float = 0.0,
@@ -3007,11 +2839,12 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         per_sensor_sigma: bool = False,
         CalRecVar: bool = False, 
         retain_cls: bool = False,
+        retain_lat: bool = False,
         use_checkpoint: bool = True,
 
         # --- phi incorporation toggles (set to True for combined use) ---
-        use_weighted_fusion: bool = True,   # Toggle Weighted Fusion in Aggregation
-        phi_scale: float = 0.5,             # Tunable scale for phi modulation (to avoid over-amplification)
+        use_weighted_fusion: bool = False,   # Toggle Weighted Fusion in Aggregation
+        phi_scale: float = 0.5,              # Tunable scale for phi modulation (to avoid over-amplification)
     ):
         super().__init__()
 
@@ -3032,9 +2865,9 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         self.mlp = GEGLU(d_model, mult=4)
         self.head = nn.Linear(d_model, N_channels)
 
-        self.dropout = nn.Dropout(0.1)
-        self.d_model = d_model
-        self.N_channels = N_channels
+        self.d_model       = d_model
+        self.N_channels    = N_channels
+        self.latent_tokens = latent_tokens
 
         self.overlap_ratio    = overlap_ratio
         self.importance_scale = importance_scale
@@ -3053,10 +2886,17 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
 
         # flag for retaining CLS and hierarchical reconstruction
         self.retain_cls = retain_cls
-        print(f'self.retain_cls is {self.retain_cls}')
+        self.retain_lat = retain_lat
+
         if self.retain_cls: 
             self.fusion_proj = nn.Linear(2 * d_model, d_model)  # Projects concatenated [local + CLS] back to d_model
             self.cls_gain = nn.Parameter(torch.zeros(d_model))
+            self.SpatiallyAwareCLSFusion = SpatiallyAwareCLSFusion(d_model)
+
+        if self.retain_lat:
+            # self.global_local_fusion = GlobalLocalFusionAttention(d_model, num_heads)
+            # self.global_local_fusion = GlobalAttentionPoolingFusion(d_model, num_heads)
+            self.global_local_fusion = LocallyGuidedGlobalFusion(d_model, num_heads)
 
         if CalRecVar:
             self.stats_dim = 4  # mean_d, std_d, effective_K, mean_phi
@@ -3064,51 +2904,48 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             self.var_head = nn.Linear(self.d_model + 16, self.N_channels)  # Input now larger
 
         # --- params for phi incorporation ---
-        self.SpatiallyAwareCLSFusion = SpatiallyAwareCLSFusion(d_model)
         self.use_weighted_fusion = use_weighted_fusion
         self.phi_scale = phi_scale  # Scale factor to control phi's influence
         self.use_checkpoint = use_checkpoint
+
+        # Predicting mean and variance for each channel
+        # as a global summary of the field
+        self.global_property_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 2 * self.N_channels)
+        )
 
     @staticmethod
     @torch.jit.ignore
     def _topk_aggregate(lat_proj:  torch.Tensor,   # (B,T,S,D)
                         top_idx:   torch.Tensor,   # (B,P,K)
                         weights_k: torch.Tensor,   # (B,P,K)
+                        d_k: torch.Tensor,         # (B,P,K)
+                        phi_k: torch.Tensor,       # (B,P,K)
+                        valid_k: torch.Tensor,     # (B,P,K)
+                        S: int) -> tuple[torch.Tensor, torch.Tensor]:
 
-                        CalRecVar : bool,
-                        d_k: torch.Tensor,         # Pass d_k (B,P,K)
-                        phi_k: torch.Tensor,       # Pass gathered phi (B,P,K); phi expanded per query
-                        valid_k: torch.Tensor,     # Pass valid (B,P,K)
-
-                        S: int) -> torch.Tensor:
-        """
-        Return h[b,t,p] = Σ_k w[b,p,k] · φ[b,t, top_idx[b,p,k], :]
-        More memory-friendly than the previous gather-loop
-        Also return h and per-query stats [mean_d, std_d, effective_K, mean_phi] (B,P,4)
-        """
         B, T, _, D = lat_proj.shape
         _, P, K    = top_idx.shape
         dev        = lat_proj.device
 
         w = torch.zeros(B, P, S, device=dev, dtype=lat_proj.dtype)
-        w.scatter_(2, top_idx, weights_k)           # write K weights per query
-    
-        if CalRecVar == True:
-            h = torch.einsum('btsd,bps->btpd', lat_proj, w)
+        w.scatter_(2, top_idx, weights_k)
 
-            mask = valid_k.float()
-            effective_K = mask.sum(dim=-1, keepdim=True)  # (B,P,1) number of valid sensors per query
+        h = torch.einsum('btsd,bps->btpd', lat_proj, w)
 
-            # Weighted mean/std for d_k and phi_k (using weights_k)
-            mean_d = (d_k * weights_k * mask).sum(dim=-1, keepdim=True) / (effective_K + 1e-6)  
-            var_d = ((d_k - mean_d)**2 * weights_k * mask).sum(dim=-1, keepdim=True) / (effective_K + 1e-6)
-            std_d = torch.sqrt(var_d + 1e-6)  
-            mean_phi = (phi_k * weights_k * mask).sum(dim=-1, keepdim=True) / (effective_K + 1e-6)  
+        mask = valid_k.float()
+        effective_K = mask.sum(dim=-1, keepdim=True)
+        
+        safe_denom = effective_K + 1e-8
+        mean_d = (d_k * weights_k * mask).sum(dim=-1, keepdim=True) / safe_denom
+        var_d = ((d_k - mean_d)**2 * weights_k * mask).sum(dim=-1, keepdim=True) / safe_denom
+        std_d = torch.sqrt(var_d) # No need for eps here if var_d is non-negative
+        mean_phi = (phi_k * weights_k * mask).sum(dim=-1, keepdim=True) / safe_denom
 
-            stats = torch.cat([mean_d, std_d, effective_K, mean_phi], dim=-1)  
-            return h, stats
-        else:
-            return torch.einsum('btsd,bps->btpd', lat_proj, w)
+        stats = torch.cat([mean_d, std_d, effective_K, mean_phi], dim=-1)  
+        return h, stats
 
     def forward(self,
                 z: torch.Tensor,                # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
@@ -3148,14 +2985,209 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         # Project tokens
         lat_proj = self.lat_proj(z)  # (B, T, S or S+1, d_model)
 
-        if self.retain_cls:
+        # --- Split global and local tokens ---
+        # retain_lat has higher priority than retain_cls
+        if self.retain_lat:
+            assert lat_proj.size(2) == self.latent_tokens + S, "retain_lat=True requires z to include lat with all L tokens."
+            # Global latents are the first L tokens, Local sensor tokens are the rest
+            global_latents = lat_proj[:, :, :self.latent_tokens, :]    # [B, T, L, D]
+            sensor_proj    = lat_proj[:, :, self.latent_tokens:, :]    # [B, T, S, D]
+            sensor_mask    = effective_mask[:, :, self.latent_tokens:] # [B, T, S]
+        elif self.retain_cls:
             assert lat_proj.size(2) == S + 1, "retain_cls=True requires z to include CLS at index 0."
             cls_proj    = lat_proj[:, :, 0, :]      # (B,T,d)
             sensor_proj = lat_proj[:, :, 1:, :]     # (B,T,S,d)
             sensor_mask = effective_mask[:, :, 1:]  # (B,T,S)
         else:
-            sensor_proj = lat_proj                  # (B,T,S,d)
-            sensor_mask = effective_mask            # (B,T,S)
+            global_latents = None
+            sensor_proj = lat_proj                                  # [B, T, S, D]
+            sensor_mask = effective_mask                            # [B, T, S]
+
+        # Positional tokens for queries
+        coord_tok = self.coord_proj(self.pe(Y))     # (B,P,d)
+        coord_tok = self.coord_norm(coord_tok)      # (B,P,d)
+        coord_tok = coord_tok.unsqueeze(1).expand(B, T, P, d_model).reshape(B*T, P, d_model)  # (B*T,P,d)
+
+        # Distance and importance scaling
+        d = torch.cdist(Y, sensor_coords)  # (B,P,S)
+
+        # Build a [B,S] validity mask for sensors (time-invariant proxy from t=0)
+        sensor_valid_bs = sensor_mask[:, 0, :]  # [B,S] (True if valid at t=0)
+        if padding_mask is not None and padding_mask.dim() == 2:
+            sensor_valid_bs = sensor_valid_bs & padding_mask  # [B,S]
+
+        # Set distances to inf for invalid sensors so they never get into top-k
+        gamma = self.importance_scale
+        d = d.masked_fill(~sensor_valid_bs.unsqueeze(1), float('inf'))  # [B,P,S]
+
+        phi   = phi_mean.detach()                                       # [B,S]
+        d_scaled = d / (phi[:, None, :] ** gamma + 1e-6)                # [B,P,S]
+
+        # phi   = phi_mean
+        # d_scaled = d * phi[:, None, :] ** gamma
+        # d_scaled = d * ( 1 - phi[:, None, :] + 1e-6 ) ** gamma
+        # d_scaled = d / (phi[:, None, :] ** gamma + 1e-6)
+
+        # ------------------------------------------------------------
+        # Unified top-k aggregation (K_eff = min(K, number_of_valid_sensors))
+        # If self.top_k is None, K_eff = S (i.e., use all valid sensors)
+        # ------------------------------------------------------------
+        local_S = sensor_proj.size(2)  # == S
+        if self.top_k is None:
+            K_eff = local_S
+        else:
+            K_eff = min(self.top_k, local_S)
+
+        # Top-k over smallest distances; if K_eff==S this is equivalent to "all sensors"
+        # For rows where many sensors are invalid (inf), torch.topk returns the S finite ones first anyway.
+        _, top_idx = torch.topk(d_scaled, K_eff, dim=2, largest=False)  # (B,P,K_eff)
+        d_k = torch.gather(d_scaled, 2, top_idx)                        # (B,P,K_eff)
+
+        # Gather phi and per-sensor sigma (if used) at the same indices
+        phi_expan = phi[:, None, :].expand(-1, P, -1)                     # (B,P,S)
+        phi_k     = torch.gather(phi_expan, 2, top_idx)                   # (B,P,K_eff)
+
+        if self.per_sensor_sigma:
+            sigma_k = sigma[top_idx]                                     # (B,P,K_eff)
+        else:
+            sigma_k = sigma                                              # scalar
+
+        scores = -d_k / sigma_k                                          # (B,P,K_eff)
+        scores -= scores.max(dim=-1, keepdim=True).values
+        exp    = torch.exp(scores)
+
+        # Validity at selected indices (time-invariant proxy from t=0)
+        valid_k = torch.gather(sensor_valid_bs.unsqueeze(1).expand(-1, P, -1), 2, top_idx)  # (B,P,K_eff), bool
+        exp = exp * valid_k.float()
+        weights = exp / (exp.sum(dim=-1, keepdim=True) + 1e-6)  # (B,P,K_eff)
+
+        # --- Combined Phi Incorporation (Weighted Fusion + Attention Modulation) ---
+        # Weighted Fusion (multiply phi into weights, then re-normalize)
+        if self.use_weighted_fusion:
+            weights.mul_(phi_k * self.phi_scale)  # In-place multiplication
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)  # Re-normalize
+
+        h, stats = self._topk_aggregate(sensor_proj, top_idx, weights, d_k, phi_k, valid_k, local_S)
+        if not self.CalRecVar:
+            stats = None # Explicitly set to None if not used
+
+        h = self.agg_norm(h)              # (B,T,P,d)
+        lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
+        # lat - [B*T, P, d] is the result of the top-k aggregation. 
+        # For each query point, lat holds a feature as a weighted average of the features from its K nearest sensors.
+
+        # this block re-purposes components of a cross-attention layer
+        # to act as a two-layer linear transformation block.
+        if hasattr(self.cross_attn, 'to_v'):
+            v_proj  = self.cross_attn.to_v
+            out_proj = self.cross_attn.out
+        else:
+            mha = self.cross_attn.attn
+            dim = mha.embed_dim
+            v_weight = mha.in_proj_weight[2 * dim : 3 * dim]
+            v_bias   = mha.in_proj_bias[2 * dim : 3 * dim] if mha.in_proj_bias is not None else None
+            def v_proj(x): return F.linear(x, v_weight, v_bias)
+            out_proj = mha.out_proj
+
+        local_lat = out_proj(v_proj(lat))   # (B*T,P,d)
+        # ------------------------------------------------------------------------------
+        
+        local_out_mean = None
+        local_pre      = coord_tok + local_lat    # (B*T,P,d)
+
+        if self.retain_lat:
+
+            # Reshape for the fusion module
+            global_latents_reshaped = global_latents.reshape(B*T, self.latent_tokens, d_model)
+            fused_feature = self.global_local_fusion(local_pre, global_latents_reshaped)
+
+            out_mean = self.head(fused_feature).view(B, T, P, C)
+            x_for_var = fused_feature
+
+        elif self.retain_cls:
+
+            fused_pre = self.SpatiallyAwareCLSFusion( local_pre, cls_proj.reshape(B*T, 1, d_model)) 
+
+            fused_x = self.norm(fused_pre)
+            fused_x = fused_x + self.mlp(fused_x)
+            out_mean = self.head(fused_x).view(B, T, P, C)
+            x_for_var = fused_x
+
+        else:
+
+            local_x = self.norm(local_pre)
+            # local_x = local_x + self.mlp(local_x)
+            local_out_mean = self.head(local_x).view(B, T, P, C)
+            out_mean = local_out_mean
+            x_for_var = local_x
+
+        # Optional variance head
+        out_logvar = None
+        if self.CalRecVar:
+            stats_emb = self.stats_proj(stats)                     
+            stats_emb = stats_emb.unsqueeze(1).expand(-1, T, -1, -1).reshape(B*T, P, -1)
+            x_var = torch.cat([x_for_var, stats_emb], dim=-1)      
+            logvar = self.var_head(x_var)
+            out_logvar = logvar.view(B, T, P, C)
+
+        return local_out_mean, out_mean, out_logvar
+
+    # 1031 revised: supervising cls or lat by global_out_mean
+    def _forward(self,
+                z: torch.Tensor,                # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
+                Y: torch.Tensor,                # [B, P, 2/3]
+                sensor_coords: torch.Tensor,    # [B, S, 2/3]
+                mask: torch.Tensor,             # [B, T, S] (if retain_cls=True, this is for S+1; we slice below)
+                phi_mean: torch.Tensor | None = None,
+
+                padding_mask: torch.Tensor | None = None
+                ) -> torch.Tensor:
+
+        B, T, S_or_Sp1, D_raw = z.shape
+        P              = Y.size(1)
+        C              = self.N_channels
+        dev            = z.device
+        d_model        = self.lat_proj.out_features
+
+        S = sensor_coords.size(1)  # true number of sensors (excludes CLS)
+
+        if phi_mean is None: phi_mean = torch.ones(B, S, device=dev)  # [B,S]
+
+        if self.per_sensor_sigma:
+            if (self.log_sigma is None) or (self.log_sigma.numel() != S):
+                self.log_sigma = nn.Parameter(torch.full((S,),
+                                            math.log(self.bandwidth_init),
+                                            device=dev))
+            sigma = self.log_sigma.exp()  # (S,)
+        else:
+            sigma = torch.tensor(self.bandwidth_init, device=dev)
+
+        # Combine mask and padding_mask; slice out CLS if present later
+        effective_mask = mask
+        if padding_mask is not None:
+            padding_bt = padding_mask.unsqueeze(1).expand(-1, T, -1)  # [B,T,S or S+1]
+            effective_mask = mask & padding_bt
+
+        # Project tokens
+        lat_proj = self.lat_proj(z)  # (B, T, S or S+1, d_model)
+
+        # --- Split global and local tokens ---
+        # retain_lat has higher priority than retain_cls
+        if self.retain_lat:
+            assert lat_proj.size(2) == self.latent_tokens + S, "retain_lat=True requires z to include lat with all L tokens."
+            # Global latents are the first L tokens, Local sensor tokens are the rest
+            global_latents = lat_proj[:, :, :self.latent_tokens, :]    # [B, T, L, D]
+            sensor_proj    = lat_proj[:, :, self.latent_tokens:, :]    # [B, T, S, D]
+            sensor_mask    = effective_mask[:, :, self.latent_tokens:] # [B, T, S]
+        elif self.retain_cls:
+            assert lat_proj.size(2) == S + 1, "retain_cls=True requires z to include CLS at index 0."
+            cls_proj    = lat_proj[:, :, 0, :]      # (B,T,d)
+            sensor_proj = lat_proj[:, :, 1:, :]     # (B,T,S,d)
+            sensor_mask = effective_mask[:, :, 1:]  # (B,T,S)
+        else:
+            global_latents = None
+            sensor_proj = lat_proj                                  # [B, T, S, D]
+            sensor_mask = effective_mask                            # [B, T, S]
 
         # Positional tokens for queries
         coord_tok = self.coord_proj(self.pe(Y))     # (B,P,d)
@@ -3207,7 +3239,6 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         # Validity at selected indices (time-invariant proxy from t=0)
         valid_k = torch.gather(sensor_valid_bs.unsqueeze(1).expand(-1, P, -1), 2, top_idx)  # (B,P,K_eff), bool
         exp = exp * valid_k.float()
-
         weights = exp / (exp.sum(dim=-1, keepdim=True) + 1e-6)  # (B,P,K_eff)
 
         # --- Combined Phi Incorporation (Weighted Fusion + Attention Modulation) ---
@@ -3216,22 +3247,13 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             weights.mul_(phi_k * self.phi_scale)  # In-place multiplication
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)  # Re-normalize
 
-        if self.CalRecVar:
-            h, stats = self._topk_aggregate(sensor_proj, top_idx, weights,
-                                            True, d_k, phi_k, valid_k, local_S)
-        else:
-            h = self._topk_aggregate(sensor_proj, top_idx, weights,
-                                    False, d_k, phi_k, valid_k, local_S)
-            stats = None
+        h, stats = self._topk_aggregate(sensor_proj, top_idx, weights, d_k, phi_k, valid_k, local_S)
+        if not self.CalRecVar:
+            stats = None # Explicitly set to None if not used
 
         h = self.agg_norm(h)              # (B,T,P,d)
         lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
-        # lat - [B*T, P, d] is the result of the top-k aggregation. 
-        # For each of the P query points, lat holds a feature vector 
-        # that is a weighted average of the features from its K nearest sensor locations.
 
-        # this block re-purposes components of a cross-attention layer
-        # to act as a two-layer linear transformation block.
         if hasattr(self.cross_attn, 'to_v'):
             v_proj  = self.cross_attn.to_v
             out_proj = self.cross_attn.out
@@ -3246,26 +3268,33 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
         local_lat = out_proj(v_proj(lat))
         # ------------------------------------------------------------------------------
         
-        local_out_mean = None
+        local_out_mean  = None
+        global_out_mean = None
+        local_pre       = coord_tok + local_lat    # (B*T,P,d)
+
+        if self.retain_lat:
+
+            # Reshape for the fusion module
+            global_latents_reshaped = global_latents.reshape(B*T, self.latent_tokens, d_model)
+
+            fused_feature = self.global_local_fusion(local_pre, global_latents_reshaped)
+            final_x = self.norm(fused_feature)
+            final_x = final_x + self.mlp(final_x)
+            out_mean = self.head(final_x).view(B, T, P, C)
+            x_for_var = final_x
+
         if self.retain_cls:
 
-            # cls_proj_bt  = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
-
-            local_pre    = coord_tok + local_lat
-            # fused_concat = torch.cat([local_pre, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
-            # fused_pre    = self.fusion_proj(fused_concat)  # (B*T, P, d_model) - learned fusion
-
-            # fused_concat = torch.cat([local_lat, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
-            # fused_lat    = self.fusion_proj(fused_concat)
-            # fused_pre    = coord_tok + fused_lat
-
-            # fused_pre    = coord_tok + local_lat + cls_proj_bt
+            cls_proj_bt  = cls_proj.reshape(B*T, 1, d_model).expand(-1, P, -1)  # (B*T,P,d)
+            cls_x = self.norm(cls_proj_bt + coord_tok)
+            cls_x = cls_x + self.mlp(cls_x)
+            global_out_mean = self.head(cls_x).view(B, T, P, C)
 
             fused_pre = self.SpatiallyAwareCLSFusion( local_pre, cls_proj.reshape(B*T, 1, d_model)) 
-
             fused_x = self.norm(fused_pre)
             fused_x = fused_x + self.mlp(fused_x)
             out_mean = self.head(fused_x).view(B, T, P, C)
+
             x_for_var = fused_x
         else:
             local_pre = coord_tok + local_lat
@@ -3277,211 +3306,6 @@ class SoftDomainAdaptiveReconstructor(nn.Module):
             x_for_var = local_x
 
         # Optional variance head
-        out_logvar = None
-        if self.CalRecVar:
-            stats_emb = self.stats_proj(stats)                     
-            stats_emb = stats_emb.unsqueeze(1).expand(-1, T, -1, -1).reshape(B*T, P, -1)
-            x_var = torch.cat([x_for_var, stats_emb], dim=-1)      
-            logvar = self.var_head(x_var)
-            out_logvar = logvar.view(B, T, P, C)
-
-        return local_out_mean, out_mean, out_logvar
-
-    # Revised 0926: sensor reconstruction from sensor tokens
-    def _forward(self,
-                z: torch.Tensor,                # [B, T, S, D_raw] or [B, T, S+1, D_raw] if retain_cls=True
-                Y: torch.Tensor,                # [B, P, 2/3]
-                sensor_coords: torch.Tensor,    # [B, S, 2/3]
-                mask: torch.Tensor,             # [B, T, S] (if retain_cls=True, this is for S+1; we slice below)
-                phi_mean: torch.Tensor | None = None,
-
-                padding_mask: torch.Tensor | None = None
-                ):
-        """
-        Returns:
-            global_out_mean: [B, T, S, C] if retain_cls=True else None
-            out_mean:        [B, T, P, C]
-            out_logvar:      [B, T, P, C] or None
-        """
-        B, T, S_or_Sp1, D_raw = z.shape
-        P              = Y.size(1)
-        C              = self.N_channels
-        dev            = z.device
-        d_model        = self.lat_proj.out_features
-
-        S = sensor_coords.size(1)  # true number of sensors (excludes CLS)
-
-        if phi_mean is None: 
-            phi_mean = torch.ones(B, S, device=dev)  # [B,S]
-
-        if self.per_sensor_sigma:
-            if (self.log_sigma is None) or (self.log_sigma.numel() != S):
-                self.log_sigma = nn.Parameter(torch.full((S,),
-                                            math.log(self.bandwidth_init),
-                                            device=dev))
-            sigma = self.log_sigma.exp()  # (S,)
-        else:
-            sigma = torch.tensor(self.bandwidth_init, device=dev)
-
-        # Combine mask and padding_mask; slice out CLS if present later
-        effective_mask = mask
-        if padding_mask is not None:
-            padding_bt = padding_mask.unsqueeze(1).expand(-1, T, -1)  # [B,T,S or S+1]
-            effective_mask = mask & padding_bt
-
-        # Project tokens
-        lat_proj = self.lat_proj(z)  # (B, T, S or S+1, d_model)
-
-        if self.retain_cls:
-            assert lat_proj.size(2) == S + 1, "retain_cls=True requires z to include CLS at index 0."
-            cls_proj    = lat_proj[:, :, 0, :]      # (B,T,d)
-            sensor_proj = lat_proj[:, :, 1:, :]     # (B,T,S,d)
-            sensor_mask = effective_mask[:, :, 1:]  # (B,T,S)
-        else:
-            sensor_proj = lat_proj                  # (B,T,S,d)
-            sensor_mask = effective_mask            # (B,T,S)
-
-        # Positional tokens for queries (Y)
-        coord_tok = self.coord_proj(self.pe(Y))     # (B,P,d)
-        coord_tok = self.coord_norm(coord_tok)      # (B,P,d)
-        coord_tok = coord_tok.unsqueeze(1).expand(B, T, P, d_model).reshape(B*T, P, d_model)  # (B*T,P,d)
-
-        # Distance and importance scaling for Y aggregation
-        d = torch.cdist(Y, sensor_coords)  # (B,P,S)
-
-        # Build a [B,S] validity mask for sensors (time-invariant proxy from t=0)
-        sensor_valid_bs = sensor_mask[:, 0, :]  # [B,S] (True if valid at t=0)
-        if padding_mask is not None and padding_mask.dim() == 2:
-            sensor_valid_bs = sensor_valid_bs & padding_mask  # [B,S]
-
-        # Set distances to inf for invalid sensors so they never get into top-k
-        d = d.masked_fill(~sensor_valid_bs.unsqueeze(1), float('inf'))  # [B,P,S]
-        phi   = phi_mean.detach()                                       # [B,S]
-        gamma = self.importance_scale
-        d_scaled = d / (phi[:, None, :] ** gamma + 1e-6)                # [B,P,S]
-
-        # ------------------------------------------------------------
-        # Unified top-k aggregation (K_eff = min(K, number_of_valid_sensors))
-        # If self.top_k is None, K_eff = S (i.e., use all valid sensors)
-        # ------------------------------------------------------------
-        local_S = sensor_proj.size(2)  # == S
-        if self.top_k is None:
-            K_eff = local_S
-        else:
-            K_eff = min(self.top_k, local_S)
-
-        # Top-k over smallest distances
-        _, top_idx = torch.topk(d_scaled, K_eff, dim=2, largest=False)  # (B,P,K_eff)
-        d_k = torch.gather(d_scaled, 2, top_idx)                        # (B,P,K_eff)
-
-        # Gather phi and per-sensor sigma (if used) at the same indices
-        phi_expan = phi[:, None, :].expand(-1, P, -1)                   # (B,P,S)
-        phi_k     = torch.gather(phi_expan, 2, top_idx)                 # (B,P,K_eff)
-
-        if self.per_sensor_sigma:
-            sigma_k = sigma[top_idx]                                    # (B,P,K_eff)
-        else:
-            sigma_k = sigma                                            # scalar
-
-        scores = -d_k / sigma_k                                         # (B,P,K_eff)
-        scores -= scores.max(dim=-1, keepdim=True).values
-        exp    = torch.exp(scores)
-
-        # Validity at selected indices (time-invariant proxy from t=0)
-        valid_k = torch.gather(sensor_valid_bs.unsqueeze(1).expand(-1, P, -1), 2, top_idx)  # (B,P,K_eff), bool
-        exp = exp * valid_k.float()
-
-        weights = exp / (exp.sum(dim=-1, keepdim=True) + 1e-6)          # (B,P,K_eff)
-
-        # --- Phi-weighted fusion (optional) ---
-        if self.use_weighted_fusion:
-            weights.mul_(phi_k * self.phi_scale)
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
-
-        # Aggregate sensor latents for Y
-        if self.CalRecVar:
-            h, stats = self._topk_aggregate(sensor_proj, top_idx, weights,
-                                            True, d_k, phi_k, valid_k, local_S)
-        else:
-            h = self._topk_aggregate(sensor_proj, top_idx, weights,
-                                     False, d_k, phi_k, valid_k, local_S)
-            stats = None
-
-        h = self.agg_norm(h)              # (B,T,P,d)
-        lat = h.reshape(B*T, P, d_model)  # (B*T,P,d)
-
-        # Lightweight "V" -> "out" path from cross-attn module
-        if hasattr(self.cross_attn, 'to_v'):
-            v_proj  = self.cross_attn.to_v
-            out_proj = self.cross_attn.out
-        else:
-            mha = self.cross_attn.attn
-            dim = mha.embed_dim
-            v_weight = mha.in_proj_weight[2 * dim : 3 * dim]
-            v_bias   = mha.in_proj_bias[2 * dim : 3 * dim] if mha.in_proj_bias is not None else None
-            def v_proj(x): return F.linear(x, v_weight, v_bias)
-            out_proj = mha.out_proj
-
-        # Y-field reconstruction
-        local_lat = out_proj(v_proj(lat))  # [B*T,P,d]
-        local_pre = coord_tok + local_lat
-
-        if self.retain_cls:
-            # Compute CLS projection once (on [B*T, 1, d]) and expand afterward
-            cls_proj_bt = cls_proj.reshape(B*T, 1, d_model)  # [B*T, 1, d]
-            
-            cls_lat_single = out_proj(v_proj(cls_proj_bt))    # [B*T, 1, d] - compute once
-            cls_lat = cls_lat_single.expand(-1, P, -1)        # [B*T, P, d] - expand result
-            fused_pre = local_pre + cls_lat
-
-            # fused_concat = torch.cat([local_lat, cls_lat], dim=-1)  # (B*T, P, 2*d_model)
-            # fused_lat    = self.fusion_proj(fused_concat)
-            # fused_pre    = coord_tok + fused_lat
-
-            fused_x = self.norm(fused_pre)
-            fused_x = fused_x + self.mlp(fused_x)
-            out_mean = self.head(fused_x).view(B, T, P, C)
-            x_for_var = fused_x
-        else:
-            local_x = self.norm(local_pre)
-            local_x = local_x + self.mlp(local_x)
-            out_mean = self.head(local_x).view(B, T, P, C)
-            x_for_var = local_x
-
-        # ------------------------------------------------------------
-        # Sensor reconstruction from sensor tokens (exclude CLS)
-        # Use the same v->out path and same head for consistency
-        # ------------------------------------------------------------
-        # Coordinate tokens for sensors
-        coord_tok_s = self.coord_proj(self.pe(sensor_coords))               # (B,S,d)
-        coord_tok_s = self.coord_norm(coord_tok_s)                          # (B,S,d)
-        coord_tok_s_bt = coord_tok_s.unsqueeze(1).expand(B, T, S, d_model)\
-                                    .reshape(B*T, S, d_model)               # (B*T,S,d)
-
-        # Project sensor tokens through v->out
-        sensor_bt = sensor_proj.reshape(B*T, S, d_model)                    # (B*T,S,d)
-        sensor_lat_bt = out_proj(v_proj(sensor_bt))                         # (B*T,S,d)
-
-        # Fuse with coordinates and predict
-        global_pre_bt = coord_tok_s_bt + sensor_lat_bt                      # (B*T,S,d)
-
-        if self.retain_cls:
-            # Fuse CLS into sensor reconstruction
-            cls_lat_s = cls_lat_single.expand(-1, S, -1)                    # [B*T, S, d] - expand the same projected CLS to S
-            # cls_lat_s = self.norm(cls_lat_s)
-            global_pre_bt = global_pre_bt + cls_lat_s                       # Add CLS to the sensor pre features
-
-        global_x_bt = self.norm(global_pre_bt)
-        global_x_bt = global_x_bt + self.mlp(global_x_bt)
-        global_out_mean = self.head(global_x_bt).view(B, T, S, C)           # (B,T,S,C)
-
-        # Optionally zero-out invalid sensor positions
-        if sensor_mask is not None:
-            global_out_mean = global_out_mean.masked_fill(
-                (~sensor_mask).unsqueeze(-1), 0.0
-            )
-
-        # Optional variance head on Y
         out_logvar = None
         if self.CalRecVar:
             stats_emb = self.stats_proj(stats)                     
@@ -3599,6 +3423,7 @@ class TD_ROM_Bay_DD(nn.Module):
                  use_adaptive_selection: bool  = False,
                  CalRecVar             : bool  = False, 
                  retain_cls            : bool  = False, 
+                 retain_lat            : bool  = False,
                  Use_imp_in_dyn        : bool  = False,
                  ):
 
@@ -4887,3 +4712,22 @@ class VAE_Wrapper(nn.Module):
         
 # ________________________________________________________
 
+'''
+                                          +-------------------------+
+                                          | (k) Global Context Vecs |
+                                          +-------------------------+
+                                                       ^
+                                                       | (Step 2: Cross-Attention)
+                                                       | Q: k dynamic queries
+                                                       | K,V: L global latents
++--------------------------+              +-------------------------+              +-------------------------+
+| (P) Fused Output Features| <------------+ (k) Global Context Vecs | <------------+  (k) Dynamic Queries    |
++--------------------------+  (Step 3)    +-------------------------+              +-------------------------+
+             ^                Cross-Attn                                                       ^
+             |                Q: P local feats                                                 | (Step 1: Cross-Attention)
+             |                K,V: k global context                                            | Q: k distillation queries
+             |                                                                                 | K,V: P local features
++--------------------------+                                                    +-----------------------------+
+|   (P) Local Features     |--------------------------------------------------->|   (P) Local Features        |
++--------------------------+                                                    +-----------------------------+
+'''

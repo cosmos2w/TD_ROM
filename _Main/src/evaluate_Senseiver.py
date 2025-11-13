@@ -51,6 +51,8 @@ def load_yaml_config(base_dir, net_index, stage_index, Repeat_id):
           f"#-----------------------------------------")
     return cfg
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2] 
+DATA_ROOT = REPO_ROOT 
 def load_h5_data(h5_path):
     """
     Load the processed HDF5 dataset using the repository-standard format.
@@ -60,6 +62,13 @@ def load_h5_data(h5_path):
         time_vector : Tensor of shape (N_t,)
 
     """
+
+    h5_path = pathlib.Path(h5_path)
+    if not h5_path.is_absolute():
+        h5_path = (REPO_ROOT / h5_path).resolve()  # or use DATA_ROOT if fp is relative to repo root
+    if not h5_path.exists():
+        raise FileNotFoundError(f"Data file not found: {h5_path}")
+
     with h5py.File(h5_path, "r") as f:
         fields_np  = f["fields"][...].astype("float32")        # (1,N_t,N_x,N_y,N_z,2)
         coords  = f["coordinates"][...].astype("float32")   # (N_x,N_y,N_z,N_z,3)
@@ -94,26 +103,24 @@ def load_h5_data(h5_path):
 # ---------------------------------------------------------
 def build_model(cfg: dict,  N_c: int, device: torch.device) -> TD_ROM:
 
-    if cfg['Stage'] == 0:
-        Net_Name = f"Senseiver_id{cfg['case_index']}_st{cfg['Stage']}"
-    else:
-        Net_Name = f"Senseiver_id{cfg['case_index']}_st{cfg['Stage']}_num{cfg['Repeat_id']}"
+    Net_Name = f"Senseiver_id{cfg['case_index']}_st{cfg['Stage']}_num{cfg['Repeat_id']}"
 
     encoder = TDROMEncoder_Sen(input_ch         = N_c,
                                coord_dim        = cfg["Spatial_Dim"],
-                            preproc_ch          = cfg["F_dim"],
-                            num_latents         = cfg["latent_tokens"],
-                            num_latent_channels = cfg["F_dim"],
-                            num_layers          = cfg["num_layers"],
-                            num_cross_attention_heads = cfg["num_heads"],
-                            num_self_attention_heads  = cfg["num_heads"],
-                            num_self_attention_layers_per_block = cfg["num_layers_block"],
-                            latent_to_feat_dim                  = cfg["F_dim"],
-                            
-                            num_pos_bands                       = 64
-                            )
-
+                               domain_sizes     = [ cfg["Num_x"], cfg["Num_y"] ],
+                               preproc_ch          = cfg["F_dim"],
+                               num_latents         = cfg["latent_tokens"],
+                               num_latent_channels = cfg["F_dim"],
+                               num_layers          = cfg["num_layers"],
+                               num_cross_attention_heads = cfg["num_heads"],
+                               num_self_attention_heads  = cfg["num_heads"],
+                               num_self_attention_layers_per_block = cfg["num_layers_block"],
+                               latent_to_feat_dim                  = cfg["F_dim"],
+                               
+                               num_pos_bands                       = 64
+                            )      
     field_dec = Decoder_Sen(coord_dim          = cfg["Spatial_Dim"],
+                            domain_sizes     = [ cfg["Num_x"], cfg["Num_y"] ],
                                 preproc_ch          = cfg["F_dim"],
                                 num_latent_channels = cfg["F_dim"],
                                 latent_size         = cfg["latent_size"],
@@ -127,9 +134,8 @@ def build_model(cfg: dict,  N_c: int, device: torch.device) -> TD_ROM:
         dt      = cfg["delta_t"],
     )
 
-    net = TD_ROM(encoder, decoder_lat, field_dec,
-                delta_t = cfg["delta_t"], N_window = cfg["N_window"], Net_Name = Net_Name,
-                CheckPhi = cfg["CheckPhi"], stage=cfg["Stage"])  
+    net = TD_ROM(encoder, decoder_lat, field_dec, 
+                delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"]) 
 
     return net, Net_Name
 
@@ -563,7 +569,15 @@ def reconstruct(cfg, args):
     
 def main():
     parser = argparse.ArgumentParser(description="Senseiver Evaluation")
-    parser.add_argument('--indice', type=int, default=2, 
+
+    parser.add_argument(
+        "--dataset",
+        default="collinear_flow_Re100",
+        type=str,
+        help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
+    )
+
+    parser.add_argument('--indice', type=int, default=1, 
                         help='net checkpoint index: which net')
     parser.add_argument('--stage', type=int, default=0, 
                         help='net checkpoint index: which stage')
@@ -572,18 +586,18 @@ def main():
     parser.add_argument("--Data_case_idx", type=int, default=0,
                         help="Case index to be selected for evaluation in the dataset")
 
-    parser.add_argument("--T_ini", type=int, default=9500,
+    parser.add_argument("--T_ini", type=int, default=29999,
                         help="Initial time index from which to start prediction")
     parser.add_argument("--N_pred", type=int, default=1,
                         help="Number of time steps to predict")
-    parser.add_argument("--num_space_sample", type=int, default=256,
+    parser.add_argument("--num_space_sample", type=int, default=24,
                         help="Number of spatial points to supply to the encoder")
     
     parser.add_argument("--SAVE_GIF", action='store_true', default=False,
                         help="If true and N_pred > 1, save a GIF of the reconstructed temporal data")
     parser.add_argument("--cmap", type=str, default="coolwarm",
                         help="Colormap for plotting the physical field")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=8,
                         help="Random seed for reproducibility")
     parser.add_argument("--plot_ids", type=int, nargs="*", default=None,
                    help="indices within the prediction window to plot "
@@ -591,8 +605,9 @@ def main():
     args = parser.parse_args()
 
     script_dir = pathlib.Path(__file__).resolve().parent
-    project_root = script_dir.parent.parent
-    config_base_dir = project_root / "Save_config_files" / "config_bk_Senseiver"
+    project_root = script_dir.parent
+    dataset = args.dataset
+    config_base_dir = project_root / "Save_config_files" / dataset / "config_bk_Senseiver"
 
     cfg = load_yaml_config(config_base_dir, args.indice, args.stage, args.Repeat_id)
 

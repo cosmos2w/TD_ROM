@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch, torch.nn as nn, torch.nn.functional as F
 
-from dataloading import make_loaders
+from dataloading import make_loaders, make_loaders_DSUS
 
 from utils.plot_utils import plot_loss_history
 from utils.SpecialLosses import compute_psd, compute_spectrum
@@ -29,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--dataset",
-        default="channel_flow",
+        default="collinear_flow_Re40",
         type=str,
         help="Datasets: channel_flow, collinear_flow_Re40, collinear_flow_Re100, cylinder_flow, FN_reaction_diffusion, sea_temperature, turbulent_combustion",
     )
@@ -72,11 +72,13 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
     NN_A2U      = MLP(mlp_A2U)
 
     Net_Name = f"TD_ROM_id{cfg['case_index']}_st{cfg['Stage']}_num{cfg['Repeat_id']}"
+    channel_to_encode = cfg["channel_to_encode"] if "channel_to_encode" in cfg else None
 
     Use_Adaptive_Selection = cfg.get("Use_Adaptive_Selection", False)
     domain_decompose       = cfg.get('domain_decompose', False)
     CalRecVar              = cfg.get("CalRecVar", False)
     retain_cls             = cfg.get("retain_cls", False)
+    retain_lat             = cfg.get("retain_lat", False)
     Use_imp_in_dyn         = cfg.get("Use_imp_in_dyn", False)
 
     if domain_decompose:
@@ -89,6 +91,8 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             latent_tokens   = cfg["latent_tokens"],
             pooling         = cfg["pooling"],
             retain_cls      = retain_cls,
+            retain_lat      = retain_lat,
+            channel_to_encode = channel_to_encode
         )
         print(f'\nBuilding Domain Adaptive Encoder as the sensor encoder!\n')
     else:
@@ -140,12 +144,14 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
             d_model=cfg["F_dim"],
             num_heads=cfg["num_heads"],
             N_channels=N_c,
+            latent_tokens=cfg["latent_tokens"],
             # pe_module=encoder.embed['pos_embed'],
             
             importance_scale=cfg["importance_scale"],
             bandwidth_init=cfg["bandwidth_init"], top_k=cfg["top_k"], per_sensor_sigma=cfg["per_sensor_sigma"], 
-            CalRecVar = CalRecVar,
+            CalRecVar  = CalRecVar,
             retain_cls = retain_cls,
+            retain_lat = retain_lat,
         )
         print(f'\nBuilding SoftDomainAdaptiveReconstructor as the field reconstructor!\n')
     else:
@@ -161,7 +167,7 @@ def build_model(cfg: dict,  N_c: int) -> TD_ROM:
         net = TD_ROM_Bay_DD(cfg, encoder, decoder_lat, field_dec,
                     delta_t = cfg["delta_t"], N_window = cfg["N_window"], stage=cfg["Stage"],
                     use_adaptive_selection = Use_Adaptive_Selection, CalRecVar = CalRecVar, 
-                    retain_cls = retain_cls, Use_imp_in_dyn = Use_imp_in_dyn)
+                    retain_cls = retain_cls, retain_lat = retain_lat, Use_imp_in_dyn = Use_imp_in_dyn)
         print(f'\nBuilding TD_ROM_Bay_DD as the model wrapper!\n')
     else:
         net = TD_ROM(encoder, decoder_lat, field_dec, 
@@ -236,6 +242,7 @@ def select_and_gather_batch(G_d,                 # [B, T, N_x, N_call]
 
 # Helper for ELBO (orthogonalized from loop)
 def compute_elbo(base_model, uncert, coords, stage, cfg):
+
     log_ab_1 = base_model.phi_mlp_1(coords)                         # [N_pts, 2]
     alpha_1  = torch.exp(log_ab_1[:, 0]) + 1e-3                     # [N_pts]
     beta_1   = torch.exp(log_ab_1[:, 1]) + 1e-3                     # [N_pts]
@@ -261,8 +268,10 @@ def compute_elbo(base_model, uncert, coords, stage, cfg):
         phi_1_s = phi_dist_1.rsample()  # [N_pts]
         phi_2_s = phi_dist_2.rsample() if 'phi_dist_2' in locals() else torch.ones_like(phi_1_s)
         phi_s = phi_1_s * phi_2_s
-        # log_lik += (uncert * phi_s).mean()
-        log_lik += - (uncert * (1 - phi_s)).mean()  # to penalize low phi in high-uncert areas
+
+        log_lik += (uncert * phi_s).mean()
+        # log_lik += (uncert * (1 - phi_s)).mean()
+        # log_lik += - (uncert * (1 - phi_s)).mean()  # to penalize low phi in high-uncert areas
 
     log_lik /= mc_samples_elbo
 
@@ -282,6 +291,7 @@ def compute_elbo(base_model, uncert, coords, stage, cfg):
 
     var_phi = torch.var(phi_mean_all)
     var_weight = cfg["bayesian_phi"].get("var_weight", 1.0)  # Weight to encourage phi variance
+
     elbo = log_lik - kl + cfg["bayesian_phi"].get("vi_entropy_weight", 0.1) * entropy + var_weight * var_phi
     return -elbo  # Return negative for loss
 
@@ -291,32 +301,57 @@ def train(cfg: dict):
     device_ids = cfg["device_ids"]
     device = torch.device(f"cuda:{device_ids[0]}" if torch.cuda.is_available() else "cpu")
 
-    train_ld, test_ld, N_c, Num_all_recon_pts = make_loaders(
-        cfg["data_h5"],
-        num_time_sample    = cfg["num_time_sample"],
-        num_space_sample   = cfg["num_space_sample"],
-        multi_factor       = cfg["multi_factor"],
-        train_ratio        = cfg["train_ratio"],
-        batch_size         = cfg["batch_size"],
-        workers            = cfg["num_workers"],
-        channel            = cfg["channel"],
-        process_mode       = cfg["process_mode"],
-        num_samples        = cfg["num_samples"],
-        Full_Field_DownS   = cfg["Full_Field_DownS"],
-        global_restriction = cfg["global_restriction"],
-        sample_restriction = cfg["sample_restriction"],
-        sample_params      = cfg["Sample_Parameters"],
-    )
+    USE_DSUS = cfg.get("USE_DSUS", False)
+    if USE_DSUS:
+        train_ld, test_ld, N_c, Num_all_recon_pts = make_loaders_DSUS(
+            cfg["data_h5"],
+            num_time_sample    = cfg["num_time_sample"],
+            num_space_sample   = cfg["num_space_sample"],
+
+            Num_x              = cfg["Num_x"],
+            Num_y              = cfg["Num_y"],
+            global_downsample_ratio = cfg["global_downsample_ratio"],
+
+            multi_factor       = cfg["multi_factor"],
+            train_ratio        = cfg["train_ratio"],
+            batch_size         = cfg["batch_size"],
+            workers            = cfg["num_workers"],
+            channel            = cfg["channel"],
+            process_mode       = cfg["process_mode"],
+            num_samples        = cfg["num_samples"],
+            Full_Field_DownS   = cfg["Full_Field_DownS"],
+            global_restriction = cfg["global_restriction"],
+            sample_restriction = cfg["sample_restriction"],
+            sample_params      = cfg["Sample_Parameters"],
+        )
+    else:
+        train_ld, test_ld, N_c, Num_all_recon_pts = make_loaders(
+            cfg["data_h5"],
+            num_time_sample    = cfg["num_time_sample"],
+            num_space_sample   = cfg["num_space_sample"],
+            multi_factor       = cfg["multi_factor"],
+            train_ratio        = cfg["train_ratio"],
+            batch_size         = cfg["batch_size"],
+            workers            = cfg["num_workers"],
+            channel            = cfg["channel"],
+            process_mode       = cfg["process_mode"],
+            num_samples        = cfg["num_samples"],
+            Full_Field_DownS   = cfg["Full_Field_DownS"],
+            global_restriction = cfg["global_restriction"],
+            sample_restriction = cfg["sample_restriction"],
+            sample_params      = cfg["Sample_Parameters"],
+        )
 
     # 2) model / opt ------------------------------------------
     Use_Adaptive_Selection = cfg.get("Use_Adaptive_Selection", False)  # Default to False if not in YAML
     CalRecVar              = cfg.get("CalRecVar", False)  if Use_Adaptive_Selection else False
 
-    retain_cls             = cfg.get("retain_cls", False) # if Use_Adaptive_Selection else False
-    Supervise_Sensors      = cfg.get("Supervise_Sensors", False)  # if Use_Adaptive_Selection else False
+    retain_cls             = cfg.get("retain_cls", False) 
+    retain_lat             = cfg.get("retain_lat", False) 
+    Supervise_Sensors      = cfg.get("Supervise_Sensors", False)
 
-    BATCH_DOWNSAMPLE       = cfg.get("BATCH_DOWNSAMPLE", False) # if we further downsample G_d in each batch
-    DOWNSAMPLE_LOGIC       = cfg.get("DOWNSAMPLE_LOGIC", "random") # random or optimal. if optimal, use select_and_gather_batch()
+    BATCH_DOWNSAMPLE       = cfg.get("BATCH_DOWNSAMPLE", False)     # if we further downsample G_d in each batch for sparse adaptation test
+    DOWNSAMPLE_LOGIC       = cfg.get("DOWNSAMPLE_LOGIC", "random")  # random or optimal. if optimal, use select_and_gather_batch()
 
     model, Net_Name = build_model(cfg, N_c)
 
@@ -423,7 +458,7 @@ def train(cfg: dict):
         
         teacher_force_p = max(0.05, 0.50 - epoch / 1000)
         w_traj = 1.0
-        w_cls  = 1.0
+        w_cls  = cfg.get("Loss_cls_Weight", 0.10)
 
         if CalRecVar:
             nll_anneal_frac = min(epoch / cfg.get("nll_anneal_epochs", 100), 1.0)  
@@ -444,8 +479,33 @@ def train(cfg: dict):
         train_loss_psd_list = []
         train_loss_spectrum_list = []
 
-        for G_d, G_dt, G_f, Y, U in train_ld:
-            G_d, G_dt, G_f, Y, U = map(lambda x: x.to(device), (G_d, G_dt, G_f, Y, U))
+        # for G_d, G_dt, G_f, Y, U in train_ld:
+        #     G_d, G_dt, G_f, Y, U = map(lambda x: x.to(device), (G_d, G_dt, G_f, Y, U))
+        #     B, num_time_sample, N_x, N_call = G_d.shape  
+
+            # true_global_mean = G_f.mean(dim=2)  # [B, T, C]
+            # true_global_var = G_f.var(dim=2)    # [B, T, C]
+            # true_global_properties = torch.cat([true_global_mean, true_global_var], dim=-1) # [B, T, 2*C]
+
+        for batch in train_ld:
+            if USE_DSUS:
+                # Unpack 6 tensors when using the DSUS loader
+                G_d, G_dt, G_f, G_f_glb, Y, U = batch
+                G_d, G_dt, G_f, G_f_glb, Y, U = map(
+                    lambda x: x.to(device), 
+                    (G_d, G_dt, G_f, G_f_glb, Y, U)
+                )
+            else:
+                # Unpack 5 tensors when using the standard loader
+                G_d, G_dt, G_f, Y, U = batch
+                G_d, G_dt, G_f, Y, U = map(
+                    lambda x: x.to(device), 
+                    (G_d, G_dt, G_f, Y, U)
+                )                
+
+        # for G_d, G_dt, G_f, G_f_glb, Y, U in train_ld:
+        #     G_d, G_dt, G_f, G_f_glb, Y, U = map(lambda x: x.to(device), (G_d, G_dt, G_f, G_f_glb, Y, U))
+
             B, num_time_sample, N_x, N_call = G_d.shape  
 
             downsample_ratio = 1.0
@@ -507,9 +567,9 @@ def train(cfg: dict):
             
             if update_phi:  # ELBO components: to reward high phi on high residuals
                 coords_for_phi = Y[0]  # [N_pts, 2]
-                # ----------------------------------------
-                var_pred = torch.exp(out_logvar).detach() if out_logvar is not None else torch.zeros_like(out)
 
+                # ----------------------------------------
+                # var_pred = torch.exp(out_logvar).detach() if out_logvar is not None else torch.zeros_like(out)
                 # Choice (1) pool over batch/time/channel
                 # uncert = var_pred.mean(dim=(0,1,3))            # shape [N_pts]
 
@@ -518,12 +578,24 @@ def train(cfg: dict):
                 # uncert = uncert_batch.max(dim=0)[0]      # Max over batches → [N_pts]
 
                 # Choice (3) per-batch max & mean mixing across batches
-                uncert_max  = torch.amax(var_pred, dim=(0,1,3))      # Max over batches → [N_pts]
-                uncert_mean = var_pred.mean(dim=(0,1,3))             # Mean over batches → [N_pts]
-                uncert = 0.5 * uncert_max # + 0.5 * uncert_mean
+                # uncert_max  = torch.amax(var_pred, dim=(0,1,3))      # Max over batches → [N_pts]
+                # uncert_mean = var_pred.mean(dim=(0,1,3))             # Mean over batches → [N_pts]
+                # uncert = 0.5 * uncert_max # + 0.5 * uncert_mean
+                # ----------------------------------------
 
-                uncert = (uncert - uncert.min()) / (uncert.max() - uncert.min() + 1e-6)  # Normalize
-                uncert = uncert ** 1.5
+                # ----------------------------------------
+                # residuals = (out - G_f).abs().mean([0,1,3])   # [B, N_t, N_pts, N_c] -> [N_pts]
+
+                # residuals = (out - G_f).abs().mean([1,3])       # Mean over T/C per batch → [B, N_pts]
+                # residuals = residuals.max(dim=0)[0]             # Max over batches → [N_pts]
+
+                residuals = (out - G_f).abs()[0, 0, :, 0]
+
+                uncert = residuals.detach()
+                # ----------------------------------------
+
+                uncert = (uncert - uncert.min()) / (uncert.max() - uncert.min() + 1e-8)  # Normalize
+                # uncert = uncert ** 1.5
 
                 # Compute spectral_uncert and blend with uncert
                 if stage == 0  : l_spectral = l_psd
@@ -560,17 +632,36 @@ def train(cfg: dict):
             # -----------------------------
 
             if N_c > 1: # Vectorized per-channel MSE
-                if stage == 2:
-                    loss_mse_channels = [mse(out[..., ci], G_f[..., ci]) for ci in range(N_c)]
+                loss_mse_channels = [mse(out[..., ci], G_f[..., ci]) for ci in range(N_c)]
                 loss_mse  = sum(loss_mse_channels)
             else:
                 loss_mse  = mse(out, G_f)
 
-            loss_U = 0.0
+            # loss_U = 0.0    
+            # 1031 asign loss_U to supervise cls
+            if retain_cls is True and G_u_cls is not None and G_f_glb is not None:
+                if N_c > 1:
+                    loss_mse_channels_cls = []
+                    for ci in range(N_c):
+                        loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
+                        loss_mse_channels_cls.append(loss_channel)
+                    loss_U  = w_cls * sum(loss_mse_channels_cls)
+                else:
+                    loss_U  = w_cls * mse(G_u_cls, G_f_glb)
+                # loss_U = w_cls * mse(G_u_cls, true_global_properties.detach())
+            else: loss_U = 0.0
 
             if stage == 0 and Supervise_Sensors:
                 # print(f'G_u_mean_Sens.shape is {G_u_mean_Sens.shape}')
-                loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
+                # print(f'G_d.shape is {G_d.shape}')
+                # loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
+
+                if N_c > 1: # Vectorized per-channel MSE
+                    loss_obs_channels = [mse(G_u_mean_Sens[..., ci], G_d[:, :, :, (2+ci)]) for ci in range(N_c)] 
+                    loss_obs  = sum(loss_obs_channels)
+                else:
+                    loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
+
             else:  loss_obs = 0.0
             
             if cfg["N_window"] == num_time_sample or stage == 0: loss_traj = 0.0
@@ -634,10 +725,33 @@ def train(cfg: dict):
 
             first_batch_viz_data = None 
 
-            for batch_idx, (G_d, G_dt, G_f, Y, U) in enumerate(test_ld):
+            # for batch_idx, (G_d, G_dt, G_f, Y, U) in enumerate(test_ld):
+            #     G_d, G_dt, G_f, Y, U = map(lambda x: x.to(device), (G_d, G_dt, G_f, Y, U))
 
-                G_d, G_dt, G_f, Y, U = map(lambda x: x.to(device), (G_d, G_dt, G_f, Y, U))
+            for batch_idx, batch in enumerate(test_ld):
+                if USE_DSUS:
+                    # Unpack 6 tensors when using the DSUS loader
+                    G_d, G_dt, G_f, G_f_glb, Y, U = batch
+                    G_d, G_dt, G_f, G_f_glb, Y, U = map(
+                        lambda x: x.to(device), 
+                        (G_d, G_dt, G_f, G_f_glb, Y, U)
+                    )
+                else:
+                    # Unpack 5 tensors when using the standard loader
+                    G_d, G_dt, G_f, Y, U = batch
+                    G_d, G_dt, G_f, Y, U = map(
+                        lambda x: x.to(device), 
+                        (G_d, G_dt, G_f, Y, U)
+                    )
+
+            # for batch_idx, (G_d, G_dt, G_f, G_f_glb, Y, U) in enumerate(test_ld):
+            #     G_d, G_dt, G_f, G_f_glb, Y, U = map(lambda x: x.to(device), (G_d, G_dt, G_f, G_f_glb, Y, U))
+
                 B, num_time_sample, N_x, N_call = G_d.shape
+
+                true_global_mean = G_f.mean(dim=2)  # [B, T, C]
+                true_global_var = G_f.var(dim=2)    # [B, T, C]
+                true_global_properties = torch.cat([true_global_mean, true_global_var], dim=-1) # [B, T, 2*C]
 
                 out, out_logvar, obs, traj, traj_logvar, G_u_cls, G_u_mean_Sens,G_u_logvar_Sens = model(G_d, G_f, Y, U, teacher_force_p)
 
@@ -669,23 +783,28 @@ def train(cfg: dict):
                 else:
                     loss_mse  = mse(out, G_f)
 
-                # if retain_cls is True and G_u_cls is not None:
-                #     if N_c > 1:
-                #         loss_mse_channels_cls = []
-                #         for ci in range(N_c):
-                #             if stage == 2:
-                #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-                #             else:
-                #                 loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
-                #             loss_mse_channels_cls.append(loss_channel)
-                #         loss_U  = w_cls * sum(loss_mse_channels_cls)
-                #     else:
-                #         loss_U  = w_cls * mse(G_u_cls, G_f)
-                # else: loss_U = 0.0
-                loss_U = 0.0
+                if retain_cls is True and G_u_cls is not None and G_f_glb is not None:
+                    if N_c > 1:
+                        loss_mse_channels_cls = []
+                        for ci in range(N_c):
+                            loss_channel = mse(G_u_cls[..., ci], G_f[..., ci],)
+                            loss_mse_channels_cls.append(loss_channel)
+                        loss_U  = w_cls * sum(loss_mse_channels_cls)
+                    else:
+                        loss_U  = w_cls * mse(G_u_cls, G_f_glb)
+                    # loss_U = w_cls * mse(G_u_cls, true_global_properties.detach())
+                else: loss_U = 0.0
+                # loss_U = 0.0
 
                 if stage == 0 and Supervise_Sensors:
-                    loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
+                    # loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
+
+                    if N_c > 1: # Vectorized per-channel MSE
+                        loss_obs_channels = [mse(G_u_mean_Sens[..., ci], G_d[:, :, :, (2+ci)]) for ci in range(N_c)] 
+                        loss_obs  = sum(loss_obs_channels)
+                    else:
+                        loss_obs = mse(G_u_mean_Sens, G_d[:, :, :, 2:3])
+
                 else:  loss_obs = 0.0
 
                 if cfg["N_window"] == num_time_sample or stage == 0: loss_traj = 0.0
@@ -841,7 +960,20 @@ def train(cfg: dict):
                 x = coords[:, 0].detach().cpu().numpy()  # [N_pts]
                 y = coords[:, 1].detach().cpu().numpy()  # [N_pts]
                 
-                # Plot scatter with color by averaged phi_mean
+                residuals_np = uncert.detach().cpu().numpy()  # [N_pts] , or residuals.detach().cpu().numpy()
+                # Residuals plot
+                plt.figure(figsize=(6, 6))
+                res_vmin = float( residuals_np.min() )
+                res_vmax = float( residuals_np.max() )
+                scatter_res = plt.scatter(x, y, c=residuals_np, cmap='plasma', vmin=res_vmin, vmax=res_vmax, s=10)
+                plt.colorbar(scatter_res, label='Residuals')
+                plt.title(f'Epoch {epoch}: Residuals Distribution')
+                plt.xlabel('x')
+                plt.ylabel('y')
+                plt.savefig(os.path.join(f"{viz_dir}/Case_num{Case_num}_Stage{Stage_num}_num{Repeat_id}", f'residuals_epoch_{epoch}.png'))
+                plt.close()
+
+                # Plot scatter by averaged phi_mean
                 plt.figure(figsize=(6, 6))
                 vmin = float(mean_phi.min().item())
                 vmax = float(mean_phi.max().item())
@@ -928,8 +1060,11 @@ def train(cfg: dict):
             # if avg_test_loss_mse < best_test: 
             #     best_test, epochs_no_imp = avg_test_loss_mse, 0
             
-            if avg_train_loss_mse < best_test:
-                best_test, epochs_no_imp = avg_train_loss_mse, 0
+            # if avg_train_loss_mse < best_test:
+            #     best_test, epochs_no_imp = avg_train_loss_mse, 0
+
+            if (avg_test_loss_mse+avg_train_loss_mse)/2 < best_test: 
+                best_test, epochs_no_imp = (avg_test_loss_mse+avg_train_loss_mse)/2, 0
 
                 ckpt_dir = pathlib.Path(cfg["save_net_dir"]); ckpt_dir.mkdir(exist_ok=True, parents=True)
                 state_dict = (model.module if isinstance(model, nn.DataParallel) else model).state_dict()

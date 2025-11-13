@@ -1,17 +1,15 @@
 
 # Notes ________________________________________
-# Repeat 7; in Original reconstructor, utilized new fusion order:
+# New Baseline
 
-# fused_concat = torch.cat([local_lat, cls_proj_bt], dim=-1)  # (B*T, P, 2*d_model)
-# fused_lat    = self.fusion_proj(fused_concat)
-# fused_pre    = coord_tok + fused_lat
+# With Imp & CLS; MLP enabled in reconstructor
 
 #_______________________________________________
 
-device_ids        : [1]
+device_ids        : [0]
 
-case_index        : 12
-Stage             : 0
+case_index        : 2
+Stage             : 1
 # 0: Only sparse reconstruction 
 # 1: Only temporal propagation 
 # -1: Train both together
@@ -24,16 +22,16 @@ Spatial_Dim       : 2          # Spatial dimension: 1, 2 or 3
 delta_t           : 0.001      
 U_dim             : 1          # Dummy in this case
 
-N_window          : 1
-num_time_sample   : 1          # N_ts, for encoder to generate latent trajectory
-num_space_sample  : 64         # N_xs, spatial points randomly sampled
+N_window          : 16
+num_time_sample   : 64          # N_ts, for encoder to generate latent trajectory
+num_space_sample  : 32         # N_xs, spatial points randomly sampled
 multi_factor      : 1.0
 
 num_workers       : 8
 train_ratio       : 0.90
-batch_size        : 256
-num_samples       : 1024            # Resample of cases in one epoch
-Full_Field_DownS  : 0.30            # Downsampling ratio for reconstruction evaluation in training
+batch_size        : 32
+num_samples       : 256            # Resample of cases in one epoch
+Full_Field_DownS  : 0.20            # Downsampling ratio for reconstruction evaluation in training
 
 channel           : 0               # Choose between 0, 1,...-1. For channel =-1 the code load all fields
 process_mode      : MeanStdStand    # Choose between MinMaxNorm, MeanStdStand, SymLogQuant and None
@@ -41,28 +39,28 @@ process_mode      : MeanStdStand    # Choose between MinMaxNorm, MeanStdStand, S
 Use_Adaptive_Selection : True          # Enable Bayesian φ
 domain_decompose       : True          # Enable adaptive domain decomposition
 
-global_restriction     : False         # Determine if we restrict the whole reconstruction area
-sample_restriction     : False         # Determine if we restrict the sampling area
+global_restriction     : True         # Determine if we restrict the whole reconstruction area
+sample_restriction     : True         # Determine if we restrict the sampling area
 Sample_Parameters:                     # Regions that we limit sampling
   x_lo              : -0.6
   x_hi              : 0.6
   y_lo              : -0.9
-  y_hi              : 0.6
+  y_hi              : 0.5
 
 bandwidth_init : 0.05
 top_k : 32
 per_sensor_sigma : True  
 overlap_ratio: 0.02
-importance_scale: 0.25
+importance_scale: 0.50
 
 # model ---------------------------------------------------
 Reload_Trained    : False
 
-F_dim             : 64
-num_heads         : 16
+F_dim             : 32
+num_heads         : 4
 num_layers        : 4
 num_layers_propagator : 4
-latent_tokens     : 64               # For cross-att in perceiver reconstructor
+latent_tokens     : 32               # For cross-att in perceiver reconstructor
 
 decoder_type      : CausalTrans         # LinTrans or DelayNODE or *CausalTrans or StdTrans or UD_Trans
 reconstructor_type: Perceiver        # Perceiver or DeepONet
@@ -80,15 +78,15 @@ warmup_epochs     : 50
 monitor_every     : 5
 patience_epochs   : 1000
 
-CalRecVar         : True
 retain_cls        : True
 Supervise_Sensors : True
+CalRecVar         : False
 use_temporal      : False
 
 Loss_Traj_Weight  : 1.0
 
 nll_anneal_epochs : 500
-nll_weight        : 0.00001
+nll_weight        : 0.0000
 
 psd_weight        : 0.10
 spectrum_weight   : 0.10
@@ -98,17 +96,17 @@ spectral_blend_weight : 0.5
 bayesian_phi:
   update_in_stage1 : True           # allow updates of mlp_phi in Stage-1 (temporal roll-out)
   phi_mlp_hidden_dim: 128           # Hidden size for φ MLP
-  prior_alpha: 1.0                  # Beta prior: alpha (e.g., 2.0 biases toward retaining points early)
-  prior_beta: 1.0                   # Beta prior: beta (e.g., 5.0 for lower drop-off probs initially)
+  prior_alpha: 0.5                  # Beta prior: alpha (e.g., 2.0 biases toward retaining points early)
+  prior_beta: 0.5                   # Beta prior: beta (e.g., 5.0 for lower drop-off probs initially)
   mc_samples_elbo: 5
   ema_alpha: 0.25                   # EMA decay for aggregating residuals (0.1 = slow adaptation)
 
-  vi_entropy_weight: 0.020
-  var_weight       : 0.20
-  lambda_kl: 0.02                     # Weight for the kl loss to pull towards prior
-  lambda_elbo: 0.001                 # Weight for the (negative) ELBO term in the main loss (integrates VI into single objective)
+  vi_entropy_weight: 0.010
+  var_weight       : 0.10
+  lambda_kl: 0.01                     # Weight for the kl loss to pull towards prior
+  lambda_elbo: 0.001                  # Weight for the (negative) ELBO term in the main loss (integrates VI into single objective)
 
-  anneal_epochs: 100                # Epochs to anneal threshold from low (retain ~1024) to high
+  anneal_epochs: 200                 # Epochs to anneal threshold from low (retain ~1024) to high
   min_retain: 128                    # Minimum points to retain (fallback if too aggressive)
   max_retain: 128                    # Maximum points early on (warm-up)
 
